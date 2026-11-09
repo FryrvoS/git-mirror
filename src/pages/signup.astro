@@ -1,0 +1,41 @@
+---
+import '../styles/global.css';
+import ThemeScript from '@/components/theme/ThemeScript.astro';
+import { SignupPage } from '@/components/auth/SignupPage';
+import { db, users } from '@/lib/db';
+import { sql } from 'drizzle-orm';
+import { withBase } from '@/lib/base-path';
+
+// Check if any users exist in the database
+const userCountResult = await db
+  .select({ count: sql<number>`count(*)` })
+  .from(users);
+const userCount = userCountResult[0]?.count;
+
+// Redirect to login if users already exist
+if (userCount !== null && Number(userCount) > 0) {
+  return Astro.redirect(withBase('/login'));
+}
+
+const generator = Astro.generator;
+---
+
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width" />
+    <link rel="icon" type="image/svg+xml" href={withBase('/favicon.svg')} />
+    <meta name="generator" content={generator} />
+    <title>Setup Admin Account - Gitea Mirror</title>
+    <ThemeScript />
+  </head>
+  <body>
+    <div class="h-dvh flex flex-col items-center justify-center bg-muted/30 p-4">
+      <div class="mb-8 text-center">
+        <h1 class="text-3xl font-bold mb-2">Welcome to Gitea Mirror</h1>
+        <p class="text-muted-foreground">Let's set up your administrator account to get started.</p>
+      </div>
+      <SignupPage client:load />
+    </div>
+  </body>
+</html>

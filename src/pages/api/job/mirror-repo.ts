@@ -1,0 +1,254 @@
+import type { APIRoute } from "astro";
+import type { Octokit } from "@octokit/rest";
+import { createGitHubAppClient } from "@/lib/github-app-client";
+import { isGitHubAppCredential } from "@/lib/github-app-credentials";
+import type { SourceRecord } from "@/lib/sources";
+import {
+  decryptSourceToken,
+  findSourceForRepository,
+  listSources,
+  resolveGitHubApiBaseUrl,
+} from "@/lib/sources";
+import type { MirrorRepoRequest, MirrorRepoResponse } from "@/types/mirror";
+import { db, configs, repositories } from "@/lib/db";
+import { and, eq, inArray, sql } from "drizzle-orm";
+import { repositoryVisibilityEnum, repoStatusEnum } from "@/types/Repository";
+import { getGiteaRepoOwnerAsync } from "@/lib/gitea";
+import { mirrorRepositoryToDestination } from "@/lib/mirror-dispatch";
+import { createGitHubClient, createPublicGitHubClient } from "@/lib/github";
+import { processWithResilience } from "@/lib/utils/concurrency";
+import { createSecureErrorResponse } from "@/lib/utils";
+import { requireAuthenticatedUserId } from "@/lib/auth-guards";
+
+export const POST: APIRoute = async ({ request, locals }) => {
+  try {
+    const authResult = await requireAuthenticatedUserId({ request, locals });
+    if ("response" in authResult) return authResult.response;
+    const userId = authResult.userId;
+
+    const body: MirrorRepoRequest = await request.json();
+    const { repositoryIds } = body;
+
+    if (!repositoryIds || !Array.isArray(repositoryIds)) {
+      return new Response(
+        JSON.stringify({
+          success: false,
+          message: "repositoryIds are required.",
+        }),
+        { status: 400, headers: { "Content-Type": "application/json" } }
+      );
+    }
+
+    if (repositoryIds.length === 0) {
+      return new Response(
+        JSON.stringify({
+          success: false,
+          message: "No repository IDs provided.",
+        }),
+        { status: 400, headers: { "Content-Type": "application/json" } }
+      );
+    }
+
+    // Fetch config — prefer active and most-recently-updated to avoid picking
+    // a stale inactive stub when multiple rows exist (see issue #271).
+    const configResult = await db
+      .select()
+      .from(configs)
+      .where(eq(configs.userId, userId))
+      .orderBy(sql`${configs.isActive} DESC`, sql`${configs.updatedAt} DESC`)
+      .limit(1);
+
+    const config = configResult[0];
+
+    if (!config || !config.giteaConfig?.token) {
+      return new Response(
+        JSON.stringify({ error: "Config missing for the user or destination token." }),
+        { status: 400, headers: { "Content-Type": "application/json" } }
+      );
+    }
+
+    // Fetch repos
+    const repos = await db
+      .select()
+      .from(repositories)
+      .where(
+        and(
+          eq(repositories.userId, userId),
+          inArray(repositories.id, repositoryIds)
+        )
+      );
+
+    if (!repos.length) {
+      return new Response(
+        JSON.stringify({ error: "No repositories found for the given IDs." }),
+        { status: 404, headers: { "Content-Type": "application/json" } }
+      );
+    }
+
+    // Start async mirroring in background with parallel processing and resilience
+    setTimeout(async () => {
+      // Only GitHub sources need an API client while mirroring (metadata).
+      // Other hosts get code-only mirrors through Gitea. The selected
+      // repositories can come from different sources, so the client is
+      // built per repository from its own source, never one for the batch.
+      const sources = await listSources(userId);
+      const octokitForSource = (source: SourceRecord | null): Octokit | null => {
+        if (!source || source.provider !== "github") return null;
+        const token = decryptSourceToken(source.token);
+        if (isGitHubAppCredential(token)) {
+          return createGitHubAppClient(token, { userId, apiBaseUrl: resolveGitHubApiBaseUrl(source.url) });
+        }
+        // A tokenless GitHub source still gets an anonymous public client
+        // (60 req/hr) so public-repo metadata mirrors; an empty token must
+        // never reach createGitHubClient, which would send `auth: ""`.
+        return token
+          ? createGitHubClient(
+              token,
+              userId,
+              source.username || undefined,
+              resolveGitHubApiBaseUrl(source.url)
+            )
+          : createPublicGitHubClient(resolveGitHubApiBaseUrl(source.url));
+      };
+
+      // Define the concurrency limit - adjust based on API rate limits
+      const CONCURRENCY_LIMIT = 3;
+
+      // Process repositories in parallel with resilience to container restarts
+      await processWithResilience(
+        repos,
+        async (repo) => {
+          // Prepare repository data
+          const repoData = {
+            ...repo,
+            status: repoStatusEnum.parse("imported"),
+            organization: repo.organization ?? undefined,
+            lastMirrored: repo.lastMirrored ?? undefined,
+            errorMessage: repo.errorMessage ?? undefined,
+            forkedFrom: repo.forkedFrom ?? undefined,
+            visibility: repositoryVisibilityEnum.parse(repo.visibility),
+            mirroredLocation: repo.mirroredLocation || "",
+          };
+
+          // Log the start of mirroring
+          console.log(`Starting mirror for repository: ${repo.name}`);
+
+          const repoSource = findSourceForRepository(repo, sources);
+
+          // Determine where the repository should be mirrored (with organization overrides)
+          const owner = await getGiteaRepoOwnerAsync({
+            config,
+            repository: repoData,
+            sourceUsername: repoSource?.username,
+          });
+
+          console.log(`Repository ${repo.name} will be mirrored to owner: ${owner}`);
+
+          // For single-org strategy, or when mirroring to an org,
+          // use the org mirroring function to ensure proper organization handling
+          const mirrorStrategy = config.githubConfig?.mirrorStrategy || 
+            (config.giteaConfig?.preserveOrgStructure ? "preserve" : "flat-user");
+          
+          const shouldUseOrgMirror = 
+            owner !== config.giteaConfig?.defaultOwner || // Different owner means org
+            mirrorStrategy === "single-org"; // Single-org strategy always uses org
+
+          // Gitea and Forgejo receive a pull mirror; GitHub and GitLab are
+          // pushed by the engine. The dispatcher picks the path.
+          await mirrorRepositoryToDestination({
+            config,
+            octokit: octokitForSource(repoSource),
+            repository: repoData,
+            orgName: shouldUseOrgMirror ? owner : undefined,
+          });
+
+          return repo;
+        },
+        {
+          userId: config.userId || "",
+          jobType: "mirror",
+          getItemId: (repo) => repo.id,
+          getItemName: (repo) => repo.name,
+          concurrencyLimit: CONCURRENCY_LIMIT,
+          maxRetries: 2,
+          retryDelay: 2000,
+          checkpointInterval: 5, // Checkpoint every 5 repositories to reduce event frequency
+          onProgress: (completed, total, result) => {
+            const percentComplete = Math.round((completed / total) * 100);
+            console.log(
+              `Mirroring progress: ${percentComplete}% (${completed}/${total})`
+            );
+
+            if (result) {
+              console.log(`Successfully mirrored repository: ${result.name}`);
+            }
+          },
+          onRetry: (repo, error, attempt) => {
+            console.log(
+              `Retrying repository ${repo.name} (attempt ${attempt}): ${error.message}`
+            );
+          },
+        }
+      );
+
+      console.log("All repository mirroring tasks completed");
+    }, 0);
+
+    const responsePayload: MirrorRepoResponse = {
+      success: true,
+      message: "Mirror job started.",
+      repositories: repos.map((repo) => ({
+        ...repo,
+        status: repoStatusEnum.parse(repo.status),
+        organization: repo.organization ?? undefined,
+        lastMirrored: repo.lastMirrored ?? undefined,
+        errorMessage: repo.errorMessage ?? undefined,
+        forkedFrom: repo.forkedFrom ?? undefined,
+        visibility: repositoryVisibilityEnum.parse(repo.visibility),
+        mirroredLocation: repo.mirroredLocation || "",
+      })),
+    };
+
+    // Return the updated repo list to the user
+    return new Response(JSON.stringify(responsePayload), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
+  } catch (error) {
+    // Enhanced error logging for better debugging
+    console.error("=== ERROR MIRRORING REPOSITORIES ===");
+    console.error("Error type:", error?.constructor?.name);
+    console.error(
+      "Error message:",
+      error instanceof Error ? error.message : String(error)
+    );
+
+    if (error instanceof Error) {
+      console.error("Error stack:", error.stack);
+    }
+
+    // Log additional context
+    console.error("Request details:");
+    console.error("- URL:", request.url);
+    console.error("- Method:", request.method);
+    console.error("- Headers:", Object.fromEntries(request.headers.entries()));
+
+    // If it's a JSON parsing error, provide more context
+    if (error instanceof SyntaxError && error.message.includes("JSON")) {
+      console.error("🚨 JSON PARSING ERROR DETECTED:");
+      console.error(
+        "This suggests the response from Gitea API is not valid JSON"
+      );
+      console.error("Common causes:");
+      console.error("- Gitea server returned HTML error page instead of JSON");
+      console.error("- Network connection interrupted");
+      console.error("- Gitea server is down or misconfigured");
+      console.error("- Authentication token is invalid");
+      console.error("Check your Gitea server logs and configuration");
+    }
+
+    console.error("=====================================");
+
+    return createSecureErrorResponse(error, "mirror-repo API", 500);
+  }
+};

@@ -1,0 +1,1199 @@
+import { z } from "zod";
+import {
+  SOURCE_PROVIDER_KINDS,
+  type SourceProviderKind,
+} from "../source-providers/kinds";
+import type { DestinationProviderKind } from "../destination-kinds";
+import { sqliteTable, text, integer, index, uniqueIndex } from "drizzle-orm/sqlite-core";
+import { sql } from "drizzle-orm";
+
+// ===== Zod Validation Schemas =====
+export const userSchema = z.object({
+  id: z.string(),
+  username: z.string(),
+  password: z.string(),
+  email: z.email(),
+  emailVerified: z.boolean().default(false),
+  createdAt: z.coerce.date(),
+  updatedAt: z.coerce.date(),
+});
+
+export const githubConfigSchema = z.object({
+  owner: z.string(),
+  type: z.enum(["personal", "organization"]),
+  token: z.string(),
+  // Which host the repositories come from. "gitea" also covers Forgejo.
+  provider: z.enum(SOURCE_PROVIDER_KINDS).default("github"),
+  // Base URL of the instance for GitLab and Gitea sources.
+  url: z.string().optional(),
+  includeStarred: z.boolean().default(false),
+  includeForks: z.boolean().default(true),
+  skipForks: z.boolean().default(false),
+  includeArchived: z.boolean().default(false),
+  includePrivate: z.boolean().default(true),
+  includePublic: z.boolean().default(true),
+  includeCollaboratorRepos: z.boolean().default(true),
+  includeOrganizations: z.array(z.string()).default([]),
+  starredReposOrg: z.string().optional(),
+  starredReposMode: z.enum(["dedicated-org", "preserve-owner"]).default("dedicated-org"),
+  starredLists: z.array(z.string()).default([]),
+  mirrorStrategy: z.enum(["preserve", "single-org", "flat-user", "mixed"]).default("preserve"),
+  defaultOrg: z.string().optional(),
+  starredCodeOnly: z.boolean().default(false),
+  autoMirrorStarred: z.boolean().default(false),
+  skipStarredIssues: z.boolean().optional(), // Deprecated: kept for backward compatibility, use starredCodeOnly instead
+  starredDuplicateStrategy: z.enum(["suffix", "prefix", "owner-org"]).default("suffix").optional(),
+  skipPersonalRepos: z.boolean().default(false),
+});
+
+export const backupStrategyEnum = z.enum([
+  "disabled",
+  "always",
+  "on-force-push",
+  "block-on-force-push",
+]);
+
+// Which releases are mirror candidates: every one, or only the ones the source
+// does not flag as a pre-release.
+export const releaseTypeEnum = z.enum(["all", "stable"]);
+export type ReleaseType = z.infer<typeof releaseTypeEnum>;
+
+// Which source issues are candidates for mirroring. "all" keeps the historical
+// behavior; the other values narrow the GitHub listing before anything is
+// created in the destination.
+export const issueStateFilterEnum = z.enum(["all", "open", "closed"]);
+export type IssueStateFilter = z.infer<typeof issueStateFilterEnum>;
+
+/**
+ * Per-object overrides for the global mirror options in `giteaConfigSchema`.
+ *
+ * Every field is nullable, and `null`/absent means "inherit from the next tier
+ * out". Resolution order is global config -> organization -> repository, and it
+ * is applied per field, so a repository can override LFS while still inheriting
+ * the org's issue setting. See `resolveMirrorOptions` in
+ * `src/lib/utils/mirror-overrides.ts`.
+ *
+ * `releaseLimit` is the one non-boolean: how many of the newest GitHub releases
+ * to keep in Gitea (the global default is `giteaConfigSchema.releaseLimit`).
+ * It is deliberately a plain `z.number()` rather than `int().min(1)`: a stored
+ * out-of-range value must degrade to "inherit" for that field alone, not make
+ * the whole overrides object unparseable and silently drop the LFS opt-out
+ * next to it. `normalizeReleaseLimit` does the sanitizing.
+ *
+ * `releaseAssetLimit` follows the same rule (`normalizeReleaseAssetLimit`):
+ * assets are uploaded only for the newest N mirrored releases. 0 is a real
+ * value (notes only); null/absent means inherit.
+ *
+ * `releaseType` sits alongside those limits and decides which releases are
+ * candidates at all (`all`, or `stable` = everything the source does not flag as
+ * a pre-release). It is a plain optional string rather than a strict enum for
+ * the same reason as the limits: a stored typo must degrade to "inherit" for
+ * that field alone. `normalizeReleaseType` does the sanitizing, and the global
+ * default is `giteaConfigSchema.releaseType`.
+ *
+ * `releaseIncludeTags` and `releaseExcludeTags` filter by tag name on top of
+ * that, for the many projects that never set the pre-release flag but tag
+ * `v1.2.3-rc.1`. They are `z.unknown()` rather than `z.array(z.string())`
+ * because a hand-written `"releaseExcludeTags": "*-rc*"` (a bare string, not a
+ * list) would otherwise fail the parse of the whole object and silently drop
+ * the LFS opt-out stored next to it. `normalizeReleaseTagPatterns` accepts a
+ * list of strings and ignores everything else, and an empty list is not a pin:
+ * clearing the field means inherit.
+ *
+ * `mirrorIssueState` follows the same lenient-string rule as `releaseType`
+ * (`normalizeIssueState` sanitizes it). `mirrorIssueComments` and
+ * `mirrorIssueMedia` narrow what an issue pass copies; both default to on when
+ * no tier pins them.
+ *
+ * `skipForks` is organization-tier only: it opts an organization out of
+ * importing and mirroring forked repositories without touching the global
+ * `githubConfig.skipForks` switch. Null/absent inherits that global value.
+ * It is deliberately NOT part of `MIRROR_OVERRIDE_KEYS` in
+ * `mirror-overrides.ts` (those mirror `giteaConfigSchema` flags); see
+ * `ORG_SELECTION_OVERRIDE_KEYS` there.
+ */
+export const mirrorOverridesSchema = z.object({
+  lfs: z.boolean().nullable().optional(),
+  wiki: z.boolean().nullable().optional(),
+  mirrorReleases: z.boolean().nullable().optional(),
+  mirrorMetadata: z.boolean().nullable().optional(),
+  mirrorIssues: z.boolean().nullable().optional(),
+  mirrorIssueComments: z.boolean().nullable().optional(),
+  mirrorIssueMedia: z.boolean().nullable().optional(),
+  mirrorIssueState: z.string().nullable().optional(),
+  mirrorPullRequests: z.boolean().nullable().optional(),
+  mirrorLabels: z.boolean().nullable().optional(),
+  mirrorMilestones: z.boolean().nullable().optional(),
+  releaseLimit: z.number().nullable().optional(),
+  releaseAssetLimit: z.number().nullable().optional(),
+  releaseType: z.string().nullable().optional(),
+  releaseIncludeTags: z.unknown().nullable().optional(),
+  releaseExcludeTags: z.unknown().nullable().optional(),
+  skipForks: z.boolean().nullable().optional(),
+});
+
+export type MirrorOverrides = z.infer<typeof mirrorOverridesSchema>;
+
+export const giteaConfigSchema = z.object({
+  url: z.url(),
+  // Gitea and Forgejo are pull mirrors (same API); GitHub and GitLab are
+  // push targets served by src/lib/push-engine.
+  provider: z.enum(["gitea", "forgejo", "github", "gitlab"]).default("gitea"),
+  externalUrl: z.url().optional(),
+  token: z.string(),
+  defaultOwner: z.string(),
+  organization: z.string().optional(),
+  mirrorInterval: z.string().default("8h"),
+  lfs: z.boolean().default(false),
+  wiki: z.boolean().default(false),
+  visibility: z
+    .enum(["public", "private", "limited", "default"])
+    .default("default"),
+  createOrg: z.boolean().default(true),
+  templateOwner: z.string().optional(),
+  templateRepo: z.string().optional(),
+  addTopics: z.boolean().default(true),
+  topicPrefix: z.string().optional(),
+  preserveVisibility: z.boolean().default(true),
+  preserveOrgStructure: z.boolean().default(false),
+  forkStrategy: z
+    .enum(["skip", "reference", "full-copy"])
+    .default("reference"),
+  // Mirror options
+  issueConcurrency: z.number().int().min(1).default(3),
+  pullRequestConcurrency: z.number().int().min(1).default(5),
+  mirrorReleases: z.boolean().default(false),
+  releaseLimit: z.number().default(10),
+  // Upload assets only for the newest N mirrored releases. null/absent means
+  // every mirrored release gets its assets; 0 means release notes only.
+  releaseAssetLimit: z.number().nullable().optional(),
+  // Opt-in cleanup for what that limit left behind. Off by default, because
+  // the limit alone only gates uploads: attachments a release already has are
+  // never removed. Turning this on deletes the attachments of every mirrored
+  // release ranked past `releaseAssetLimit`. Global only - there is no
+  // per-repository tier for it, the ranks still come from that repository's
+  // own effective asset limit.
+  pruneOldReleaseAssets: z.boolean().default(false),
+  // Which releases are candidates: every one, or only the ones not flagged as a
+  // pre-release. The limit is applied after filtering.
+  releaseType: releaseTypeEnum.default("all"),
+  // Tag patterns narrowing that further: include keeps only matching tags,
+  // exclude drops matching ones. Applied after `releaseType`, before the limit.
+  // Empty list means no filter, which is what every config stored before this
+  // option existed behaves.
+  releaseIncludeTags: z.array(z.string()).default([]),
+  releaseExcludeTags: z.array(z.string()).default([]),
+  mirrorMetadata: z.boolean().default(false),
+  mirrorIssues: z.boolean().default(false),
+  // Which issues the pass lists, and how much of each one it copies. Defaults
+  // preserve the behavior from before these options existed.
+  mirrorIssueState: issueStateFilterEnum.default("all"),
+  mirrorIssueComments: z.boolean().default(true),
+  mirrorIssueMedia: z.boolean().default(true),
+  mirrorPullRequests: z.boolean().default(false),
+  mirrorLabels: z.boolean().default(false),
+  mirrorMilestones: z.boolean().default(false),
+  backupStrategy: backupStrategyEnum.default("on-force-push"),
+  backupBeforeSync: z.boolean().default(true), // Deprecated: kept for backward compat, use backupStrategy
+  backupRetentionCount: z.number().int().min(1).default(5),
+  backupRetentionDays: z.number().int().min(0).default(30),
+  backupDirectory: z.string().optional(),
+  blockSyncOnBackupFailure: z.boolean().default(true),
+});
+
+export const scheduleConfigSchema = z.object({
+  enabled: z.boolean().default(false),
+  interval: z.string().default("0 2 * * *"),
+  concurrent: z.boolean().default(false),
+  batchSize: z.number().default(10),
+  pauseBetweenBatches: z.number().default(5000),
+  retryAttempts: z.number().default(3),
+  retryDelay: z.number().default(60000),
+  timeout: z.number().default(3600000),
+  autoRetry: z.boolean().default(true),
+  cleanupBeforeMirror: z.boolean().default(false),
+  notifyOnFailure: z.boolean().default(true),
+  notifyOnSuccess: z.boolean().default(false),
+  logLevel: z.enum(["error", "warn", "info", "debug"]).default("info"),
+  timezone: z.string().default("UTC"),
+  onlyMirrorUpdated: z.boolean().default(false),
+  updateInterval: z.number().default(86400000),
+  skipRecentlyMirrored: z.boolean().default(true),
+  recentThreshold: z.number().default(3600000),
+  autoImport: z.boolean().default(true),
+  autoMirror: z.boolean().default(false),
+  lastRun: z.coerce.date().optional(),
+  nextRun: z.coerce.date().optional(),
+});
+
+export const cleanupConfigSchema = z.object({
+  enabled: z.boolean().default(false),
+  retentionDays: z.number().default(604800), // 7 days in seconds
+  deleteFromGitea: z.boolean().default(false),
+  deleteIfNotInGitHub: z.boolean().default(true),
+  protectedRepos: z.array(z.string()).default([]),
+  dryRun: z.boolean().default(false),
+  orphanedRepoAction: z
+    .enum(["skip", "archive", "delete"])
+    .default("archive"),
+  batchSize: z.number().default(10),
+  pauseBetweenDeletes: z.number().default(2000),
+  lastRun: z.coerce.date().optional(),
+  nextRun: z.coerce.date().optional(),
+});
+
+export const ntfyConfigSchema = z.object({
+  url: z.string().default("https://ntfy.sh"),
+  topic: z.string().default(""),
+  token: z.string().optional(),
+  priority: z.enum(["min", "low", "default", "high", "urgent"]).default("default"),
+});
+
+export const appriseConfigSchema = z.object({
+  url: z.string().default(""),
+  token: z.string().default(""),
+  tag: z.string().optional(),
+});
+
+export const gotifyConfigSchema = z.object({
+  url: z.string().default(""),
+  token: z.string().default(""),
+  priority: z.number().int().min(0).max(10).default(5),
+});
+
+export const webhookConfigSchema = z.object({
+  url: z.string().default(""),
+  secret: z.string().optional(),
+});
+
+export const notificationConfigSchema = z.object({
+  enabled: z.boolean().default(false),
+  provider: z.enum(["ntfy", "apprise", "gotify", "webhook"]).default("ntfy"),
+  notifyOnSyncError: z.boolean().default(true),
+  notifyOnSyncSuccess: z.boolean().default(false),
+  // Master switch; the three group switches below only apply while it is on.
+  notifyOnNewRepo: z.boolean().default(false),
+  notifyOnNewOwnRepo: z.boolean().default(true),
+  notifyOnNewOrgRepo: z.boolean().default(true),
+  notifyOnNewStarredRepo: z.boolean().default(true),
+  ntfy: ntfyConfigSchema.optional(),
+  apprise: appriseConfigSchema.optional(),
+  gotify: gotifyConfigSchema.optional(),
+  webhook: webhookConfigSchema.optional(),
+});
+
+export type NotificationConfig = z.infer<typeof notificationConfigSchema>;
+
+export const configSchema = z.object({
+  id: z.string(),
+  userId: z.string(),
+  name: z.string(),
+  isActive: z.boolean().default(true),
+  githubConfig: githubConfigSchema,
+  giteaConfig: giteaConfigSchema,
+  // Unused/reserved — stored for future glob support but not currently read
+  include: z.array(z.string()).default(["*"]),
+  // Unused/reserved — stored for future glob support but not currently read
+  exclude: z.array(z.string()).default([]),
+  scheduleConfig: scheduleConfigSchema,
+  cleanupConfig: cleanupConfigSchema,
+  createdAt: z.coerce.date(),
+  updatedAt: z.coerce.date(),
+});
+
+// One connected source host per row of the sources table. Parses leniently
+// for reads (defaults like githubConfigSchema); the write path in
+// src/lib/sources.ts validates strictly.
+export const sourceSchema = z.object({
+  id: z.string(),
+  userId: z.string(),
+  name: z.string(),
+  // Which host the repositories come from. "gitea" also covers Forgejo.
+  provider: z.enum(SOURCE_PROVIDER_KINDS).default("github"),
+  // Normalized base URL of the instance; the provider default is resolved
+  // on write so the empty string is never stored.
+  url: z.string().default(""),
+  username: z.string().default(""),
+  // AES-256-GCM encrypted at rest, same convention as
+  // configs.githubConfig.token. Null means public-only access.
+  token: z.string().nullable().optional(),
+  enabled: z.boolean().default(true),
+  createdAt: z.coerce.date(),
+  updatedAt: z.coerce.date(),
+});
+
+export const repositorySchema = z.object({
+  id: z.string(),
+  userId: z.string(),
+  configId: z.string(),
+  name: z.string(),
+  fullName: z.string(),
+  normalizedFullName: z.string(),
+  url: z.url(),
+  cloneUrl: z.url(),
+  owner: z.string(),
+  sourceProvider: z.string().optional(),
+  sourceUrl: z.string().optional(),
+  sourceId: z.string().optional().nullable(),
+  destinationProvider: z.string().optional(),
+  destinationUrl: z.string().optional(),
+  organization: z.string().optional().nullable(),
+  mirroredLocation: z.string().default(""),
+  isPrivate: z.boolean().default(false),
+  isForked: z.boolean().default(false),
+  forkedFrom: z.string().optional().nullable(),
+  hasIssues: z.boolean().default(false),
+  isStarred: z.boolean().default(false),
+  isArchived: z.boolean().default(false),
+  size: z.number().default(0),
+  hasLFS: z.boolean().default(false),
+  hasSubmodules: z.boolean().default(false),
+  destinationSize: z.number().optional().nullable(),
+  releaseAssetsSize: z.number().optional().nullable(),
+  releaseAssetsCount: z.number().optional().nullable(),
+  storageCheckedAt: z.coerce.date().optional().nullable(),
+  language: z.string().optional().nullable(),
+  description: z.string().optional().nullable(),
+  defaultBranch: z.string(),
+  visibility: z.enum(["public", "private", "internal"]).default("public"),
+  status: z
+    .enum([
+      "imported",
+      "mirroring",
+      "mirrored",
+      "failed",
+      "skipped",
+      "ignored",  // User explicitly wants to ignore this repository
+      "deleting",
+      "deleted",
+      "syncing",
+      "synced",
+      "archived",
+      "pending-approval", // Blocked by force-push detection, needs manual approval
+    ])
+    .default("imported"),
+  lastMirrored: z.coerce.date().optional().nullable(),
+  errorMessage: z.string().optional().nullable(),
+  destinationOrg: z.string().optional().nullable(),
+  mirrorOverrides: mirrorOverridesSchema.optional().nullable(),
+  metadata: z.string().optional().nullable(), // JSON string for metadata sync state
+  importedAt: z.coerce.date(),
+  createdAt: z.coerce.date(),
+  updatedAt: z.coerce.date(),
+});
+
+export const mirrorJobSchema = z.object({
+  id: z.string(),
+  userId: z.string(),
+  repositoryId: z.string().optional().nullable(),
+  repositoryName: z.string().optional().nullable(),
+  organizationId: z.string().optional().nullable(),
+  organizationName: z.string().optional().nullable(),
+  details: z.string().optional().nullable(),
+  status: z
+    .enum([
+      "imported",
+      "mirroring",
+      "mirrored",
+      "failed",
+      "skipped",
+      "ignored",  // User explicitly wants to ignore this repository
+      "deleting",
+      "deleted",
+      "syncing",
+      "synced",
+      "archived",
+      "pending-approval",
+      "warning", // Activity-log alert (e.g. release filters emptied a destination); never a repository status
+    ])
+    .default("imported"),
+  message: z.string(),
+  timestamp: z.coerce.date(),
+  jobType: z.enum(["mirror", "cleanup", "import"]).default("mirror"),
+  batchId: z.string().optional().nullable(),
+  totalItems: z.number().optional().nullable(),
+  completedItems: z.number().default(0),
+  itemIds: z.array(z.string()).optional().nullable(),
+  completedItemIds: z.array(z.string()).default([]),
+  inProgress: z.boolean().default(false),
+  startedAt: z.coerce.date().optional().nullable(),
+  completedAt: z.coerce.date().optional().nullable(),
+  lastCheckpoint: z.coerce.date().optional().nullable(),
+});
+
+export const organizationSchema = z.object({
+  id: z.string(),
+  userId: z.string(),
+  configId: z.string(),
+  name: z.string(),
+  normalizedName: z.string(),
+  avatarUrl: z.string(),
+  // The sources row this organization mirrors from, matching
+  // repositories.sourceId below: NULL means "not pinned" (repos of the same
+  // org name from every connected source), a dangling id falls back the same
+  // way, and no foreign key is deliberate.
+  sourceId: z.string().optional().nullable(),
+  membershipRole: z.enum(["member", "admin", "owner", "billing_manager"]).default("member"),
+  isIncluded: z.boolean().default(true),
+  destinationOrg: z.string().optional().nullable(),
+  mirrorOverrides: mirrorOverridesSchema.optional().nullable(),
+  status: z
+    .enum([
+      "imported",
+      "mirroring",
+      "mirrored",
+      "failed",
+      "skipped",
+      "ignored",  // User explicitly wants to ignore this repository
+      "deleting",
+      "deleted",
+      "syncing",
+      "synced",
+    ])
+    .default("imported"),
+  lastMirrored: z.coerce.date().optional().nullable(),
+  errorMessage: z.string().optional().nullable(),
+  repositoryCount: z.number().default(0),
+  publicRepositoryCount: z.number().optional(),
+  privateRepositoryCount: z.number().optional(),
+  forkRepositoryCount: z.number().optional(),
+  createdAt: z.coerce.date(),
+  updatedAt: z.coerce.date(),
+});
+
+export const eventSchema = z.object({
+  id: z.string(),
+  userId: z.string(),
+  channel: z.string(),
+  payload: z.any(),
+  read: z.boolean().default(false),
+  createdAt: z.coerce.date(),
+});
+
+// ===== Drizzle Table Definitions =====
+
+export const users = sqliteTable("users", {
+  id: text("id").primaryKey(),
+  name: text("name"),
+  email: text("email").notNull().unique(),
+  emailVerified: integer("email_verified", { mode: "boolean" }).notNull().default(false),
+  image: text("image"),
+  createdAt: integer("created_at", { mode: "timestamp" })
+    .notNull()
+    .default(sql`(unixepoch())`),
+  updatedAt: integer("updated_at", { mode: "timestamp" })
+    .notNull()
+    .default(sql`(unixepoch())`),
+  // Custom fields
+  username: text("username"),
+}, (_table) => []);
+
+export const events = sqliteTable("events", {
+  id: text("id").primaryKey(),
+  userId: text("user_id")
+    .notNull()
+    .references(() => users.id),
+  channel: text("channel").notNull(),
+  payload: text("payload", { mode: "json" }).notNull(),
+  read: integer("read", { mode: "boolean" }).notNull().default(false),
+  createdAt: integer("created_at", { mode: "timestamp" })
+    .notNull()
+    .default(sql`(unixepoch())`),
+}, (table) => [
+  index("idx_events_user_channel").on(table.userId, table.channel),
+  index("idx_events_created_at").on(table.createdAt),
+  index("idx_events_read").on(table.read),
+]);
+
+export const configs = sqliteTable("configs", {
+  id: text("id").primaryKey(),
+  userId: text("user_id")
+    .notNull()
+    .references(() => users.id),
+  name: text("name").notNull(),
+  isActive: integer("is_active", { mode: "boolean" }).notNull().default(true),
+
+  githubConfig: text("github_config", { mode: "json" })
+    .$type<z.infer<typeof githubConfigSchema>>()
+    .notNull(),
+
+  giteaConfig: text("gitea_config", { mode: "json" })
+    .$type<z.infer<typeof giteaConfigSchema>>()
+    .notNull(),
+
+  include: text("include", { mode: "json" })
+    .$type<string[]>()
+    .notNull()
+    .default(sql`'["*"]'`),
+
+  exclude: text("exclude", { mode: "json" })
+    .$type<string[]>()
+    .notNull()
+    .default(sql`'[]'`),
+
+  scheduleConfig: text("schedule_config", { mode: "json" })
+    .$type<z.infer<typeof scheduleConfigSchema>>()
+    .notNull(),
+
+  cleanupConfig: text("cleanup_config", { mode: "json" })
+    .$type<z.infer<typeof cleanupConfigSchema>>()
+    .notNull(),
+
+  // Do not add the group switches to this default: SQLite can only change a column
+  // default by rebuilding the configs table, and the schema defaults already cover a
+  // row written without them.
+  notificationConfig: text("notification_config", { mode: "json" })
+    .$type<z.infer<typeof notificationConfigSchema>>()
+    .notNull()
+    .default(sql`'{"enabled":false,"provider":"ntfy","notifyOnSyncError":true,"notifyOnSyncSuccess":false,"notifyOnNewRepo":false}'`),
+
+  createdAt: integer("created_at", { mode: "timestamp" })
+    .notNull()
+    .default(sql`(unixepoch())`),
+
+  updatedAt: integer("updated_at", { mode: "timestamp" })
+    .notNull()
+    .default(sql`(unixepoch())`),
+}, (_table) => []);
+
+// One connected source host per user. Multiple rows per user are allowed
+// (github.com plus a GHES instance, or GitLab plus Gitea, ...); the first
+// row by createdAt is the "primary" source mirrored into the legacy
+// configs.githubConfig connection fields for backward compatibility.
+export const sources = sqliteTable("sources", {
+  id: text("id").primaryKey(),
+  userId: text("user_id")
+    .notNull()
+    .references(() => users.id),
+  // Display label for the sources list. Auto-derived ("GitHub (octocat)")
+  // by src/lib/sources.ts when the caller leaves it blank.
+  name: text("name").notNull(),
+  provider: text("provider")
+    .$type<SourceProviderKind>()
+    .notNull(),
+  // Normalized instance base URL. The provider default is resolved on write
+  // so the empty string is never stored, which keeps the unique index below
+  // meaningful for default-instance rows.
+  url: text("url").notNull(),
+  // The account the token belongs to (the legacy config's "owner").
+  username: text("username").notNull().default(""),
+  // AES-256-GCM encrypted at rest, same convention as
+  // configs.githubConfig.token. Null means public-only access.
+  token: text("token"),
+  enabled: integer("enabled", { mode: "boolean" })
+    .notNull()
+    .default(true),
+  createdAt: integer("created_at", { mode: "timestamp" })
+    .notNull()
+    .default(sql`(unixepoch())`),
+  updatedAt: integer("updated_at", { mode: "timestamp" })
+    .notNull()
+    .default(sql`(unixepoch())`),
+}, (table) => [
+  index("idx_sources_user_id").on(table.userId),
+  uniqueIndex("uniq_sources_user_provider_url_username").on(table.userId, table.provider, table.url, table.username),
+]);
+
+export const repositories = sqliteTable("repositories", {
+  id: text("id").primaryKey(),
+  userId: text("user_id")
+    .notNull()
+    .references(() => users.id),
+  configId: text("config_id")
+    .notNull()
+    .references(() => configs.id),
+  name: text("name").notNull(),
+  fullName: text("full_name").notNull(),
+  normalizedFullName: text("normalized_full_name").notNull(),
+  url: text("url").notNull(),
+  cloneUrl: text("clone_url").notNull(),
+  // Which host the repository was imported from, and that host's base
+  // URL. The mirror step picks clone credentials from these, and the
+  // cleanup service only judges repositories from the configured source.
+  sourceProvider: text("source_provider")
+    .$type<SourceProviderKind>()
+    .notNull()
+    .default("github"),
+  sourceUrl: text("source_url").notNull().default("https://github.com"),
+  // The sources row this repository was imported from. Nullable and
+  // deliberately without a foreign key: legacy rows may reference sources
+  // that were deleted later ("switched source" state), and those rows keep
+  // their dangling id on purpose. NULL means "not linked (yet)".
+  sourceId: text("source_id"),
+  // Where the mirror lives: the destination kind and base URL recorded when
+  // the row was imported or mirrored. An empty URL means "not recorded yet".
+  destinationProvider: text("destination_provider")
+    .$type<DestinationProviderKind>()
+    .notNull()
+    .default("gitea"),
+  destinationUrl: text("destination_url").notNull().default(""),
+  owner: text("owner").notNull(),
+  organization: text("organization"),
+  mirroredLocation: text("mirrored_location").default(""),
+
+  isPrivate: integer("is_private", { mode: "boolean" })
+    .notNull()
+    .default(false),
+  isForked: integer("is_fork", { mode: "boolean" }).notNull().default(false),
+  forkedFrom: text("forked_from"),
+
+  hasIssues: integer("has_issues", { mode: "boolean" })
+    .notNull()
+    .default(false),
+  isStarred: integer("is_starred", { mode: "boolean" })
+    .notNull()
+    .default(false),
+  isArchived: integer("is_archived", { mode: "boolean" })
+    .notNull()
+    .default(false),
+
+  size: integer("size").notNull().default(0),
+  hasLFS: integer("has_lfs", { mode: "boolean" }).notNull().default(false),
+  hasSubmodules: integer("has_submodules", { mode: "boolean" })
+    .notNull()
+    .default(false),
+
+  // What the mirror takes up on the destination, in bytes, recorded from
+  // responses a sync already fetches (#479). NULL until a sync has seen it.
+  // destinationSize is Git plus LFS as the destination reports it; the release
+  // asset totals come from the listing the release retention pass reads.
+  destinationSize: integer("destination_size"),
+  releaseAssetsSize: integer("release_assets_size"),
+  releaseAssetsCount: integer("release_assets_count"),
+  storageCheckedAt: integer("storage_checked_at", { mode: "timestamp" }),
+
+  language: text("language"),
+  description: text("description"),
+  defaultBranch: text("default_branch").notNull(),
+  visibility: text("visibility").notNull().default("public"),
+
+  status: text("status").notNull().default("imported"),
+  lastMirrored: integer("last_mirrored", { mode: "timestamp" }),
+  errorMessage: text("error_message"),
+  
+  destinationOrg: text("destination_org"),
+
+  // Per-repository mirror option overrides. NULL means "inherit" (from the
+  // organization, then the global config). See mirrorOverridesSchema.
+  mirrorOverrides: text("mirror_overrides", { mode: "json" }).$type<MirrorOverrides>(),
+
+  metadata: text("metadata"), // JSON string storing metadata sync state (issues, PRs, releases, etc.)
+  importedAt: integer("imported_at", { mode: "timestamp" })
+    .notNull()
+    .default(sql`(unixepoch())`),
+
+  createdAt: integer("created_at", { mode: "timestamp" })
+    .notNull()
+    .default(sql`(unixepoch())`),
+  updatedAt: integer("updated_at", { mode: "timestamp" })
+    .notNull()
+    .default(sql`(unixepoch())`),
+}, (table) => [
+  index("idx_repositories_user_id").on(table.userId),
+  index("idx_repositories_config_id").on(table.configId),
+  index("idx_repositories_status").on(table.status),
+  index("idx_repositories_owner").on(table.owner),
+  index("idx_repositories_organization").on(table.organization),
+  index("idx_repositories_is_fork").on(table.isForked),
+  index("idx_repositories_is_starred").on(table.isStarred),
+  index("idx_repositories_user_imported_at").on(table.userId, table.importedAt),
+  // Full names are unique per source: the same "owner/repo" can legitimately
+  // exist on two connected hosts (e.g. github.com and a GHES instance).
+  // SQLite treats NULLs as distinct in unique indexes, so unlinked legacy
+  // rows (source_id NULL) never collide with each other.
+  uniqueIndex("uniq_repositories_user_full_name").on(table.userId, table.sourceId, table.fullName),
+  uniqueIndex("uniq_repositories_user_normalized_full_name").on(table.userId, table.sourceId, table.normalizedFullName),
+  index("idx_repositories_mirrored_location").on(table.userId, table.mirroredLocation),
+]);
+
+export const mirrorJobs = sqliteTable("mirror_jobs", {
+  id: text("id").primaryKey(),
+  userId: text("user_id")
+    .notNull()
+    .references(() => users.id),
+  repositoryId: text("repository_id"),
+  repositoryName: text("repository_name"),
+  organizationId: text("organization_id"),
+  organizationName: text("organization_name"),
+  details: text("details"),
+  status: text("status").notNull().default("imported"),
+  message: text("message").notNull(),
+  timestamp: integer("timestamp", { mode: "timestamp" })
+    .notNull()
+    .default(sql`(unixepoch())`),
+
+  // Job resilience fields
+  jobType: text("job_type").notNull().default("mirror"),
+  batchId: text("batch_id"),
+  totalItems: integer("total_items"),
+  completedItems: integer("completed_items").default(0),
+  itemIds: text("item_ids", { mode: "json" }).$type<string[]>(),
+  completedItemIds: text("completed_item_ids", { mode: "json" })
+    .$type<string[]>()
+    .default(sql`'[]'`),
+  inProgress: integer("in_progress", { mode: "boolean" })
+    .notNull()
+    .default(false),
+  startedAt: integer("started_at", { mode: "timestamp" }),
+  completedAt: integer("completed_at", { mode: "timestamp" }),
+  lastCheckpoint: integer("last_checkpoint", { mode: "timestamp" }),
+}, (table) => [
+  index("idx_mirror_jobs_user_id").on(table.userId),
+  index("idx_mirror_jobs_batch_id").on(table.batchId),
+  index("idx_mirror_jobs_in_progress").on(table.inProgress),
+  index("idx_mirror_jobs_job_type").on(table.jobType),
+  index("idx_mirror_jobs_timestamp").on(table.timestamp),
+]);
+
+export const organizations = sqliteTable("organizations", {
+  id: text("id").primaryKey(),
+  userId: text("user_id")
+    .notNull()
+    .references(() => users.id),
+  configId: text("config_id")
+    .notNull()
+    .references(() => configs.id),
+  name: text("name").notNull(),
+  normalizedName: text("normalized_name").notNull(),
+
+  avatarUrl: text("avatar_url").notNull(),
+
+  // The sources row this organization mirrors from, matching
+  // repositories.sourceId above: NULL means "not pinned" (repos of the same
+  // org name from every connected source), a dangling id falls back the same
+  // way, and no foreign key is deliberate.
+  sourceId: text("source_id"),
+
+  membershipRole: text("membership_role").notNull().default("member"),
+
+  isIncluded: integer("is_included", { mode: "boolean" })
+    .notNull()
+    .default(true),
+
+  destinationOrg: text("destination_org"),
+
+  // Per-organization mirror option overrides. NULL means "inherit" from the
+  // global config; repository-level overrides win over these.
+  mirrorOverrides: text("mirror_overrides", { mode: "json" }).$type<MirrorOverrides>(),
+
+  status: text("status").notNull().default("imported"),
+  lastMirrored: integer("last_mirrored", { mode: "timestamp" }),
+  errorMessage: text("error_message"),
+
+  repositoryCount: integer("repository_count").notNull().default(0),
+  publicRepositoryCount: integer("public_repository_count"),
+  privateRepositoryCount: integer("private_repository_count"),
+  forkRepositoryCount: integer("fork_repository_count"),
+
+  createdAt: integer("created_at", { mode: "timestamp" })
+    .notNull()
+    .default(sql`(unixepoch())`),
+  updatedAt: integer("updated_at", { mode: "timestamp" })
+    .notNull()
+    .default(sql`(unixepoch())`),
+}, (table) => [
+  index("idx_organizations_user_id").on(table.userId),
+  index("idx_organizations_config_id").on(table.configId),
+  index("idx_organizations_status").on(table.status),
+  index("idx_organizations_is_included").on(table.isIncluded),
+  uniqueIndex("uniq_organizations_user_normalized_name").on(table.userId, table.normalizedName),
+]);
+
+// ===== Better Auth Tables =====
+
+// Sessions table
+export const sessions = sqliteTable("sessions", {
+  id: text("id").primaryKey(),
+  token: text("token").notNull().unique(),
+  userId: text("user_id").notNull().references(() => users.id),
+  expiresAt: integer("expires_at", { mode: "timestamp" }).notNull(),
+  ipAddress: text("ip_address"),
+  userAgent: text("user_agent"),
+  createdAt: integer("created_at", { mode: "timestamp" })
+    .notNull()
+    .default(sql`(unixepoch())`),
+  updatedAt: integer("updated_at", { mode: "timestamp" })
+    .notNull()
+    .default(sql`(unixepoch())`),
+}, (table) => [
+  index("idx_sessions_user_id").on(table.userId),
+  index("idx_sessions_token").on(table.token),
+  index("idx_sessions_expires_at").on(table.expiresAt),
+]);
+
+// Accounts table (for OAuth providers and credentials)
+export const accounts = sqliteTable("accounts", {
+  id: text("id").primaryKey(),
+  accountId: text("account_id").notNull(), 
+  userId: text("user_id").notNull().references(() => users.id),
+  providerId: text("provider_id").notNull(),
+  // better-auth 1.7 keys accounts by (issuer, accountId). Local password
+  // accounts carry "local:credential"; OAuth and SSO accounts carry the
+  // provider namespace. Migration 0016 backfills existing rows.
+  issuer: text("issuer").notNull().default(""),
+  providerUserId: text("provider_user_id"), // Make nullable for email/password auth
+  accessToken: text("access_token"),
+  refreshToken: text("refresh_token"),
+  idToken: text("id_token"),
+  accessTokenExpiresAt: integer("access_token_expires_at", { mode: "timestamp" }),
+  refreshTokenExpiresAt: integer("refresh_token_expires_at", { mode: "timestamp" }),
+  scope: text("scope"),
+  expiresAt: integer("expires_at", { mode: "timestamp" }),
+  password: text("password"), // For credential provider
+  createdAt: integer("created_at", { mode: "timestamp" })
+    .notNull()
+    .default(sql`(unixepoch())`),
+  updatedAt: integer("updated_at", { mode: "timestamp" })
+    .notNull()
+    .default(sql`(unixepoch())`),
+}, (table) => [
+  index("idx_accounts_account_id").on(table.accountId),
+  index("idx_accounts_user_id").on(table.userId),
+  index("idx_accounts_provider").on(table.providerId, table.providerUserId),
+]);
+
+// Verification tokens table
+export const verificationTokens = sqliteTable("verification_tokens", {
+  id: text("id").primaryKey(),
+  token: text("token").notNull().unique(),
+  identifier: text("identifier").notNull(),
+  type: text("type").notNull(), // email, password-reset, etc
+  expiresAt: integer("expires_at", { mode: "timestamp" }).notNull(),
+  createdAt: integer("created_at", { mode: "timestamp" })
+    .notNull()
+    .default(sql`(unixepoch())`),
+}, (table) => [
+  index("idx_verification_tokens_token").on(table.token),
+  index("idx_verification_tokens_identifier").on(table.identifier),
+]);
+
+// Verifications table (for Better Auth)
+export const verifications = sqliteTable("verifications", {
+  id: text("id").primaryKey(),
+  identifier: text("identifier").notNull(),
+  value: text("value").notNull(),
+  expiresAt: integer("expires_at", { mode: "timestamp" }).notNull(),
+  createdAt: integer("created_at", { mode: "timestamp" })
+    .notNull()
+    .default(sql`(unixepoch())`),
+  updatedAt: integer("updated_at", { mode: "timestamp" })
+    .notNull()
+    .default(sql`(unixepoch())`),
+}, (table) => [
+  index("idx_verifications_identifier").on(table.identifier),
+]);
+
+// ===== OIDC Provider Tables =====
+
+// ===== OAuth 2.1 / OIDC Provider tables (@better-auth/oauth-provider) =====
+//
+// These back the OAuth/OIDC *provider* feature (gitea-mirror acting as an
+// identity provider for other apps). They are managed entirely by Better
+// Auth's drizzle adapter, so:
+//   - the exported binding name must equal the plugin model name pluralized
+//     under `usePlural: true` (oauthClient -> oauthClients, jwks -> jwkss);
+//   - the object property names must match the plugin field names (camelCase),
+//     while the SQL column names may be snake_case;
+//   - `string[]` and `json` fields are serialized to JSON text by the adapter,
+//     so they are plain `text` columns here.
+//
+// Migrated from the deprecated `oidc-provider` plugin (tables
+// oauth_applications / oauth_access_tokens / oauth_consent). See the
+// accompanying Drizzle migration for the data-preserving upgrade path.
+
+// OAuth clients (replaces the old `oauth_applications` table)
+export const oauthClients = sqliteTable("oauth_clients", {
+  id: text("id").primaryKey(),
+  clientId: text("client_id").notNull().unique(),
+  clientSecret: text("client_secret"),
+  name: text("name"),
+  disabled: integer("disabled", { mode: "boolean" }).default(false),
+  skipConsent: integer("skip_consent", { mode: "boolean" }),
+  enableEndSession: integer("enable_end_session", { mode: "boolean" }),
+  subjectType: text("subject_type"),
+  scopes: text("scopes"), // JSON string[]
+  userId: text("user_id").references(() => users.id),
+  uri: text("uri"),
+  icon: text("icon"),
+  contacts: text("contacts"), // JSON string[]
+  tos: text("tos"),
+  policy: text("policy"),
+  softwareId: text("software_id"),
+  softwareVersion: text("software_version"),
+  softwareStatement: text("software_statement"),
+  redirectUris: text("redirect_uris").notNull(), // JSON string[]
+  postLogoutRedirectUris: text("post_logout_redirect_uris"), // JSON string[]
+  tokenEndpointAuthMethod: text("token_endpoint_auth_method"),
+  grantTypes: text("grant_types"), // JSON string[]
+  responseTypes: text("response_types"), // JSON string[]
+  public: integer("public", { mode: "boolean" }),
+  type: text("type"),
+  requirePKCE: integer("require_pkce", { mode: "boolean" }),
+  // Added by @better-auth/oauth-provider 1.7 (client discovery, client
+  // credentials grant, OIDC back-channel logout, private_key_jwt, DPoP).
+  clientDiscoveryId: text("client_discovery_id"),
+  clientCredentialsScopes: text("client_credentials_scopes"), // JSON string[]
+  backchannelLogoutUri: text("backchannel_logout_uri"),
+  backchannelLogoutSessionRequired: integer("backchannel_logout_session_required", { mode: "boolean" }),
+  applicationType: text("application_type"),
+  jwks: text("jwks"),
+  jwksUri: text("jwks_uri"),
+  dpopBoundAccessTokens: integer("dpop_bound_access_tokens", { mode: "boolean" }),
+  referenceId: text("reference_id"),
+  metadata: text("metadata"), // JSON
+  createdAt: integer("created_at", { mode: "timestamp" }).default(sql`(unixepoch())`),
+  updatedAt: integer("updated_at", { mode: "timestamp" }).default(sql`(unixepoch())`),
+}, (table) => [
+  index("idx_oauth_clients_client_id").on(table.clientId),
+  index("idx_oauth_clients_user_id").on(table.userId),
+]);
+
+// OAuth access tokens
+export const oauthAccessTokens = sqliteTable("oauth_access_tokens", {
+  id: text("id").primaryKey(),
+  token: text("token").unique(),
+  clientId: text("client_id").notNull(),
+  sessionId: text("session_id"),
+  userId: text("user_id").references(() => users.id),
+  referenceId: text("reference_id"),
+  refreshId: text("refresh_id"),
+  expiresAt: integer("expires_at", { mode: "timestamp" }),
+  createdAt: integer("created_at", { mode: "timestamp" }).default(sql`(unixepoch())`),
+  scopes: text("scopes").notNull(), // JSON string[]
+  // Added by @better-auth/oauth-provider 1.7 (resource indicators, token
+  // revocation on session end, DPoP proof binding).
+  authorizationCodeId: text("authorization_code_id"),
+  resources: text("resources"), // JSON string[]
+  requestedUserInfoClaims: text("requested_user_info_claims"), // JSON string[]
+  revoked: integer("revoked", { mode: "timestamp" }),
+  confirmation: text("confirmation"), // JSON
+}, (table) => [
+  index("idx_oauth_access_tokens_token").on(table.token),
+  index("idx_oauth_access_tokens_client_id").on(table.clientId),
+  index("idx_oauth_access_tokens_user_id").on(table.userId),
+]);
+
+// OAuth refresh tokens (new in the OAuth 2.1 provider)
+export const oauthRefreshTokens = sqliteTable("oauth_refresh_tokens", {
+  id: text("id").primaryKey(),
+  token: text("token").notNull().unique(),
+  clientId: text("client_id").notNull(),
+  sessionId: text("session_id"),
+  userId: text("user_id").notNull().references(() => users.id),
+  referenceId: text("reference_id"),
+  expiresAt: integer("expires_at", { mode: "timestamp" }),
+  createdAt: integer("created_at", { mode: "timestamp" }).default(sql`(unixepoch())`),
+  revoked: integer("revoked", { mode: "timestamp" }),
+  authTime: integer("auth_time", { mode: "timestamp" }),
+  scopes: text("scopes").notNull(), // JSON string[]
+  // Added by @better-auth/oauth-provider 1.7 (resource indicators, refresh
+  // token rotation with replay detection, DPoP proof binding).
+  authorizationCodeId: text("authorization_code_id"),
+  resources: text("resources"), // JSON string[]
+  requestedUserInfoClaims: text("requested_user_info_claims"), // JSON string[]
+  rotatedAt: integer("rotated_at", { mode: "timestamp" }),
+  rotationReplayResponse: text("rotation_replay_response"),
+  rotationReplayExpiresAt: integer("rotation_replay_expires_at", { mode: "timestamp" }),
+  confirmation: text("confirmation"), // JSON
+}, (table) => [
+  index("idx_oauth_refresh_tokens_token").on(table.token),
+  index("idx_oauth_refresh_tokens_client_id").on(table.clientId),
+  index("idx_oauth_refresh_tokens_user_id").on(table.userId),
+]);
+
+// OAuth consent records
+export const oauthConsents = sqliteTable("oauth_consents", {
+  id: text("id").primaryKey(),
+  clientId: text("client_id").notNull(),
+  userId: text("user_id").references(() => users.id),
+  referenceId: text("reference_id"),
+  scopes: text("scopes").notNull(), // JSON string[]
+  // Added by @better-auth/oauth-provider 1.7 (resource indicators).
+  resources: text("resources"), // JSON string[]
+  requestedUserInfoClaims: text("requested_user_info_claims"), // JSON string[]
+  createdAt: integer("created_at", { mode: "timestamp" }).default(sql`(unixepoch())`),
+  updatedAt: integer("updated_at", { mode: "timestamp" }).default(sql`(unixepoch())`),
+}, (table) => [
+  index("idx_oauth_consents_client_id").on(table.clientId),
+  index("idx_oauth_consents_user_id").on(table.userId),
+]);
+
+// OAuth protected resources (RFC 8707 resource indicators, new in
+// @better-auth/oauth-provider 1.7). Empty unless resources are registered;
+// the 1.7 fix for unbound resource indicators only issues audience-restricted
+// tokens for resources listed here.
+export const oauthResources = sqliteTable("oauth_resources", {
+  id: text("id").primaryKey(),
+  identifier: text("identifier").notNull().unique(),
+  name: text("name").notNull(),
+  accessTokenTtl: integer("access_token_ttl"),
+  refreshTokenTtl: integer("refresh_token_ttl"),
+  signingAlgorithm: text("signing_algorithm"),
+  signingKeyId: text("signing_key_id"),
+  allowedScopes: text("allowed_scopes"), // JSON string[]
+  customClaims: text("custom_claims"), // JSON
+  dpopBoundAccessTokensRequired: integer("dpop_bound_access_tokens_required", { mode: "boolean" }),
+  disabled: integer("disabled", { mode: "boolean" }),
+  policyVersion: integer("policy_version"),
+  metadata: text("metadata"), // JSON
+  createdAt: integer("created_at", { mode: "timestamp" }).default(sql`(unixepoch())`),
+  updatedAt: integer("updated_at", { mode: "timestamp" }).default(sql`(unixepoch())`),
+}, (table) => [
+  index("idx_oauth_resources_identifier").on(table.identifier),
+]);
+
+// Which clients may request which resources (new in 1.7).
+export const oauthClientResources = sqliteTable("oauth_client_resources", {
+  id: text("id").primaryKey(),
+  clientId: text("client_id").notNull(),
+  resourceId: text("resource_id").notNull(),
+  metadata: text("metadata"), // JSON
+  createdAt: integer("created_at", { mode: "timestamp" }).default(sql`(unixepoch())`),
+}, (table) => [
+  index("idx_oauth_client_resources_client_id").on(table.clientId),
+  index("idx_oauth_client_resources_resource_id").on(table.resourceId),
+]);
+
+// Replay prevention for private_key_jwt / client_secret_jwt client assertions
+// (new in 1.7): the row id is the assertion's jti, kept until expiry.
+export const oauthClientAssertions = sqliteTable("oauth_client_assertions", {
+  id: text("id").primaryKey(),
+  expiresAt: integer("expires_at", { mode: "timestamp" }).notNull(),
+});
+
+// JWKS keypairs for signing OIDC id_tokens (better-auth `jwt` plugin).
+// Model name "jwks" pluralizes to the binding name "jwkss" under usePlural,
+// while the physical table stays "jwks".
+export const jwkss = sqliteTable("jwks", {
+  id: text("id").primaryKey(),
+  publicKey: text("public_key").notNull(),
+  privateKey: text("private_key").notNull(),
+  createdAt: integer("created_at", { mode: "timestamp" }).notNull().default(sql`(unixepoch())`),
+  expiresAt: integer("expires_at", { mode: "timestamp" }),
+  // better-auth 1.7 records the key algorithm and curve per key.
+  alg: text("alg"),
+  crv: text("crv"),
+});
+
+// ===== SSO Provider Tables =====
+
+// SSO Providers table
+export const ssoProviders = sqliteTable("sso_providers", {
+  id: text("id").primaryKey(),
+  issuer: text("issuer").notNull(),
+  domain: text("domain").notNull(),
+  oidcConfig: text("oidc_config").notNull(), // JSON string with OIDC configuration
+  // The upgraded @better-auth/sso plugin writes this on every insert (null for OIDC providers).
+  // Drizzle's adapter rejects unknown fields, so the column must exist.
+  samlConfig: text("saml_config"),
+  // Used by the SSO plugin's account-linking trust check: a sign-in is treated
+  // as trusted when this is true AND the user's email domain matches `domain`
+  // above. We set this to true on register (see /api/auth/sso/register.ts) so
+  // domain-scoped auto-linking works out of the box; the column default keeps
+  // existing rows trusted after upgrade.
+  domainVerified: integer("domain_verified", { mode: "boolean" }).notNull().default(true),
+  userId: text("user_id").notNull(), // Admin who created this provider
+  providerId: text("provider_id").notNull().unique(), // Unique identifier for the provider
+  organizationId: text("organization_id"), // Optional - if provider is linked to an organization
+  createdAt: integer("created_at", { mode: "timestamp" })
+    .notNull()
+    .default(sql`(unixepoch())`),
+  updatedAt: integer("updated_at", { mode: "timestamp" })
+    .notNull()
+    .default(sql`(unixepoch())`),
+}, (table) => [
+  index("idx_sso_providers_provider_id").on(table.providerId),
+  index("idx_sso_providers_domain").on(table.domain),
+  index("idx_sso_providers_issuer").on(table.issuer),
+]);
+
+// ===== API Keys (@better-auth/api-key) =====
+
+// Personal API keys for automation (issue #314). The plugin model is
+// "apikey"; with usePlural the adapter looks up `apikeys`, the same way
+// `jwkss` maps the jwks model. `key` holds the hash, `start` the first
+// characters for display, `referenceId` the owning user.
+export const apikeys = sqliteTable("api_keys", {
+  id: text("id").primaryKey(),
+  configId: text("config_id").notNull().default("default"),
+  name: text("name"),
+  start: text("start"),
+  prefix: text("prefix"),
+  key: text("key").notNull(),
+  referenceId: text("reference_id").notNull().references(() => users.id, { onDelete: "cascade" }),
+  refillInterval: integer("refill_interval"),
+  refillAmount: integer("refill_amount"),
+  lastRefillAt: integer("last_refill_at", { mode: "timestamp" }),
+  enabled: integer("enabled", { mode: "boolean" }).notNull().default(true),
+  // The plugin writes every row with rate limiting off (see auth.ts); the
+  // column default mirrors the plugin's own schema.
+  rateLimitEnabled: integer("rate_limit_enabled", { mode: "boolean" }).notNull().default(true),
+  rateLimitTimeWindow: integer("rate_limit_time_window"),
+  rateLimitMax: integer("rate_limit_max"),
+  requestCount: integer("request_count").notNull().default(0),
+  remaining: integer("remaining"),
+  lastRequest: integer("last_request", { mode: "timestamp" }),
+  expiresAt: integer("expires_at", { mode: "timestamp" }),
+  createdAt: integer("created_at", { mode: "timestamp" })
+    .notNull()
+    .default(sql`(unixepoch())`),
+  updatedAt: integer("updated_at", { mode: "timestamp" })
+    .notNull()
+    .default(sql`(unixepoch())`),
+  permissions: text("permissions"),
+  metadata: text("metadata"),
+}, (table) => [
+  index("idx_api_keys_reference_id").on(table.referenceId),
+  index("idx_api_keys_key").on(table.key),
+]);
+
+// ===== Rate Limit Tracking =====
+
+export const rateLimitSchema = z.object({
+  id: z.string(),
+  userId: z.string(),
+  provider: z.enum(["github", "gitea"]).default("github"),
+  limit: z.number(),
+  remaining: z.number(),
+  used: z.number(),
+  reset: z.coerce.date(),
+  retryAfter: z.number().optional(), // seconds to wait
+  status: z.enum(["ok", "warning", "limited", "exceeded"]).default("ok"),
+  lastChecked: z.coerce.date(),
+  createdAt: z.coerce.date(),
+  updatedAt: z.coerce.date(),
+});
+
+export const rateLimits = sqliteTable("rate_limits", {
+  id: text("id").primaryKey(),
+  userId: text("user_id")
+    .notNull()
+    .references(() => users.id),
+  provider: text("provider").notNull().default("github"),
+  limit: integer("limit").notNull(),
+  remaining: integer("remaining").notNull(),
+  used: integer("used").notNull(),
+  reset: integer("reset", { mode: "timestamp" }).notNull(),
+  retryAfter: integer("retry_after"), // seconds to wait
+  status: text("status").notNull().default("ok"),
+  lastChecked: integer("last_checked", { mode: "timestamp" }).notNull(),
+  createdAt: integer("created_at", { mode: "timestamp" })
+    .notNull()
+    .default(sql`(unixepoch())`),
+  updatedAt: integer("updated_at", { mode: "timestamp" })
+    .notNull()
+    .default(sql`(unixepoch())`),
+}, (table) => [
+  index("idx_rate_limits_user_provider").on(table.userId, table.provider),
+  index("idx_rate_limits_status").on(table.status),
+]);
+
+// Export type definitions
+export type User = z.infer<typeof userSchema>;
+export type Config = z.infer<typeof configSchema>;
+export type Source = z.infer<typeof sourceSchema>;
+export type Repository = z.infer<typeof repositorySchema>;
+export type MirrorJob = z.infer<typeof mirrorJobSchema>;
+export type Organization = z.infer<typeof organizationSchema>;
+export type Event = z.infer<typeof eventSchema>;
+export type RateLimit = z.infer<typeof rateLimitSchema>;

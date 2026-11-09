@@ -1,0 +1,246 @@
+import type { APIRoute } from "astro";
+import { db, organizations, repositories } from "@/lib/db";
+import { eq, and } from "drizzle-orm";
+import { z } from "zod";
+import { createSecureErrorResponse } from "@/lib/utils";
+import { requireAuth } from "@/lib/utils/auth-helpers";
+import { mirrorOverridesSchema } from "@/lib/db/schema";
+import { normalizeMirrorOverrides } from "@/lib/utils/mirror-overrides";
+import { membershipRoleEnum } from "@/types/organizations";
+import { repoStatusEnum } from "@/types/Repository";
+
+/**
+ * Partial update. Each field is optional and only written when present in the
+ * body, so updating mirror overrides does not clobber destinationOrg.
+ */
+const patchBodySchema = z.object({
+  destinationOrg: z.string().nullable().optional(),
+  mirrorOverrides: mirrorOverridesSchema.nullable().optional(),
+  sourceId: z.string().nullable().optional(),
+});
+
+/**
+ * One tracked organization, so a client watching an organization mirror does
+ * not have to fetch every row. The public, private and fork breakdowns stay
+ * on GET /api/github/organizations, which computes them per request.
+ */
+export const GET: APIRoute = async (context) => {
+  try {
+    const { user, response } = await requireAuth(context);
+    if (response) return response;
+
+    const userId = user!.id;
+    const orgId = context.params.id;
+    if (!orgId) {
+      return new Response(JSON.stringify({ error: "Organization ID is required" }), {
+        status: 400,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+
+    const [org] = await db
+      .select()
+      .from(organizations)
+      .where(and(eq(organizations.id, orgId), eq(organizations.userId, userId)))
+      .limit(1);
+
+    if (!org) {
+      return new Response(JSON.stringify({ error: "Organization not found" }), {
+        status: 404,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+
+    return new Response(
+      JSON.stringify({
+        success: true,
+        organization: {
+          ...org,
+          status: repoStatusEnum.parse(org.status),
+          membershipRole: membershipRoleEnum.parse(org.membershipRole),
+          lastMirrored: org.lastMirrored ?? undefined,
+          errorMessage: org.errorMessage ?? undefined,
+        },
+      }),
+      { status: 200, headers: { "Content-Type": "application/json" } }
+    );
+  } catch (error) {
+    return createSecureErrorResponse(error, "organization fetch", 500);
+  }
+};
+
+export const PATCH: APIRoute = async (context) => {
+  try {
+    // Check authentication
+    const { user, response } = await requireAuth(context);
+    if (response) return response;
+
+    const userId = user!.id;
+
+    const orgId = context.params.id;
+    if (!orgId) {
+      return new Response(JSON.stringify({ error: "Organization ID is required" }), {
+        status: 400,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+
+    const parsed = patchBodySchema.safeParse(await context.request.json());
+    if (!parsed.success) {
+      return new Response(
+        JSON.stringify({
+          error: "Invalid request body",
+          details: parsed.error.issues.map((issue) => ({
+            path: issue.path.join("."),
+            message: issue.message,
+          })),
+        }),
+        { status: 400, headers: { "Content-Type": "application/json" } }
+      );
+    }
+
+    const body = parsed.data;
+
+    // Validate that the organization belongs to the user
+    const [existingOrg] = await db
+      .select()
+      .from(organizations)
+      .where(and(eq(organizations.id, orgId), eq(organizations.userId, userId)))
+      .limit(1);
+
+    if (!existingOrg) {
+      return new Response(JSON.stringify({ error: "Organization not found" }), {
+        status: 404,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+
+    const updates: Record<string, unknown> = { updatedAt: new Date() };
+
+    if ("destinationOrg" in body) {
+      updates.destinationOrg = body.destinationOrg || null;
+    }
+
+    if ("mirrorOverrides" in body) {
+      updates.mirrorOverrides = normalizeMirrorOverrides(body.mirrorOverrides);
+    }
+
+    if ("sourceId" in body) {
+      const nextSourceId = body.sourceId?.trim() || null;
+      if (nextSourceId) {
+        const { listSources } = await import("@/lib/sources");
+        const owned = (await listSources(userId)).some(
+          (source) => source.id === nextSourceId
+        );
+        if (!owned) {
+          return new Response(
+            JSON.stringify({
+              error: `No source with id ${nextSourceId} belongs to this user`,
+            }),
+            { status: 400, headers: { "Content-Type": "application/json" } }
+          );
+        }
+      }
+      updates.sourceId = nextSourceId;
+    }
+
+    await db
+      .update(organizations)
+      .set(updates)
+      .where(eq(organizations.id, orgId));
+
+    const [updated] = await db
+      .select({
+        destinationOrg: organizations.destinationOrg,
+        mirrorOverrides: organizations.mirrorOverrides,
+        sourceId: organizations.sourceId,
+      })
+      .from(organizations)
+      .where(eq(organizations.id, orgId))
+      .limit(1);
+
+    return new Response(
+      JSON.stringify({
+        success: true,
+        message: "Organization updated successfully",
+        destinationOrg: updated?.destinationOrg ?? null,
+        mirrorOverrides: updated?.mirrorOverrides ?? null,
+        sourceId: updated?.sourceId ?? null,
+      }),
+      {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }
+    );
+  } catch (error) {
+    return createSecureErrorResponse(error, "Update organization", 500);
+  }
+};
+
+export const DELETE: APIRoute = async (context) => {
+  try {
+    const { user, response } = await requireAuth(context);
+    if (response) return response;
+
+    const userId = user!.id;
+    const orgId = context.params.id;
+
+    if (!orgId) {
+      return new Response(
+        JSON.stringify({ error: "Organization ID is required" }),
+        {
+          status: 400,
+          headers: { "Content-Type": "application/json" },
+        }
+      );
+    }
+
+    const [existingOrg] = await db
+      .select()
+      .from(organizations)
+      .where(and(eq(organizations.id, orgId), eq(organizations.userId, userId)))
+      .limit(1);
+
+    if (!existingOrg) {
+      return new Response(
+        JSON.stringify({ error: "Organization not found" }),
+        {
+          status: 404,
+          headers: { "Content-Type": "application/json" },
+        }
+      );
+    }
+
+    // A pinned organization only owns its source's repositories of the name;
+    // unpinned ones keep deleting every repository with that org name.
+    const deleteRepoConditions = [
+      eq(repositories.userId, userId),
+      eq(repositories.organization, existingOrg.name),
+    ];
+    if (existingOrg.sourceId) {
+      const { listSources } = await import("@/lib/sources");
+      const pinned = (await listSources(userId)).some(
+        (source) => source.id === existingOrg.sourceId
+      );
+      if (pinned) {
+        deleteRepoConditions.push(eq(repositories.sourceId, existingOrg.sourceId));
+      }
+    }
+
+    await db.delete(repositories).where(and(...deleteRepoConditions));
+
+    await db
+      .delete(organizations)
+      .where(and(eq(organizations.id, orgId), eq(organizations.userId, userId)));
+
+    return new Response(
+      JSON.stringify({ success: true }),
+      {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }
+    );
+  } catch (error) {
+    return createSecureErrorResponse(error, "Delete organization", 500);
+  }
+};

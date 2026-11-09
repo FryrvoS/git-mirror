@@ -1,0 +1,1297 @@
+/**
+ * Scheduler service for automatic repository mirroring
+ * This service runs in the background and automatically mirrors repositories
+ * based on the configured schedule
+ */
+
+import { db, configs, repositories, organizations } from '@/lib/db';
+import { eq, and, or, ne } from 'drizzle-orm';
+import { mirrorRepositoryToDestination, syncRepositoryOnDestination } from '@/lib/mirror-dispatch';
+import { usesPushEngine } from '@/lib/destination-connection';
+import { getDecryptedGitHubToken } from '@/lib/utils/config-encryption';
+import { formatDuration } from '@/lib/utils/duration-parser';
+import type { Repository } from '@/lib/db/schema';
+import type { Octokit } from '@octokit/rest';
+import { repoStatusEnum, repositoryVisibilityEnum } from '@/types/Repository';
+import {
+  mergeGitReposPreferStarred,
+  normalizeGitRepoToInsert,
+  calcBatchSizeForInsert,
+  repositoryIdentityKeys,
+  selectNewRepositoriesByIdentity,
+  dedupeRepositoriesByIdentity,
+} from '@/lib/repo-utils';
+import { isMirrorableGitHubRepo } from '@/lib/repo-eligibility';
+import { loadOrganizationForkPolicies, orgForkSkipDecision } from '@/lib/utils/mirror-overrides';
+import { createMirrorJob } from '@/lib/helpers';
+import { rediscoverRepositoriesForOrganization } from '@/lib/organization-discovery';
+import { triggerNewRepositoriesNotification } from '@/lib/notification-service';
+import { getNextScheduledRun, isCronExpression, normalizeTimezone } from '@/lib/utils/schedule-utils';
+import { resetStuckMirrorStatuses } from '@/lib/stuck-status-recovery';
+import { isRateLimitError, rateLimitGateKey, rateLimitedUntil } from '@/lib/rate-limit-gate';
+import type { SourceRecord } from '@/lib/sources';
+
+let schedulerInterval: NodeJS.Timeout | null = null;
+let isSchedulerRunning = false;
+let hasPerformedAutoStart = false; // Track if we've already done auto-start
+
+function resolveScheduleSettings(config: any): { source: string | number; timezone: string } {
+  const scheduleConfig = config.scheduleConfig || {};
+  const source = scheduleConfig.interval ||
+    config.giteaConfig?.mirrorInterval ||
+    '1h';
+  const timezone = normalizeTimezone(scheduleConfig.timezone || 'UTC');
+
+  return { source, timezone };
+}
+
+function calculateNextRun(config: any, currentTime: Date): Date {
+  const { source, timezone } = resolveScheduleSettings(config);
+
+  try {
+    return getNextScheduledRun(source, currentTime, timezone);
+  } catch (error) {
+    console.error(
+      `[Scheduler] Failed to calculate next run from source "${String(source)}" (timezone=${timezone}): ${
+        error instanceof Error ? error.message : 'Unknown error'
+      }`
+    );
+    const fallbackMs = 60 * 60 * 1000; // 1 hour
+    return new Date(currentTime.getTime() + fallbackMs);
+  }
+}
+
+function logNextRun(userId: string, source: string | number, timezone: string, currentTime: Date, nextRun: Date): void {
+  const deltaMs = Math.max(0, nextRun.getTime() - currentTime.getTime());
+  const scheduleKind = isCronExpression(source) ? 'cron' : 'interval';
+  console.log(
+    `[Scheduler] Next sync for user ${userId} scheduled for: ${nextRun.toISOString()} ` +
+    `(in ${formatDuration(deltaMs)}) using ${scheduleKind} "${String(source)}" [timezone=${timezone}]`
+  );
+}
+
+async function persistScheduleRunState(config: any, currentTime: Date, forceEnabled = false): Promise<Date> {
+  const scheduleConfig = config.scheduleConfig || {};
+  const { source, timezone } = resolveScheduleSettings(config);
+  const nextRun = calculateNextRun(config, currentTime);
+
+  await db.update(configs).set({
+    scheduleConfig: {
+      ...scheduleConfig,
+      ...(forceEnabled ? { enabled: true } : {}),
+      lastRun: currentTime,
+      nextRun,
+    },
+    updatedAt: currentTime,
+  }).where(eq(configs.id, config.id));
+
+  logNextRun(config.userId, source, timezone, currentTime, nextRun);
+  return nextRun;
+}
+
+/** Head start the next run gets after a rate limit reset, so the window is really over. */
+const RATE_LIMIT_RESUME_MARGIN_MS = 60 * 1000;
+
+/**
+ * Watches the rate limit gate for one run.
+ *
+ * A run used to sit inside Octokit until the limit reset, which held the
+ * scheduler lock for up to an hour per repository and left every later tick
+ * logging "Scheduler is already running" (issue #437). The throttle handler
+ * now records the reset instead of sleeping, and the loops below ask this
+ * watcher between batches and between repositories whether to stop. Only the
+ * first stop is logged, so a long batch loop does not repeat itself.
+ */
+function createRateLimitWatcher(userId: string) {
+  const key = rateLimitGateKey(userId);
+  let logged = false;
+
+  return {
+    /** The reset time when the source is paused, otherwise null. */
+    check(describeEffect: () => string): Date | null {
+      const until = rateLimitedUntil(key);
+      if (!until) {
+        return null;
+      }
+
+      if (!logged) {
+        logged = true;
+        console.warn(
+          `[Scheduler] Source is rate limited until ${until.toISOString()} for user ${userId}, ${describeEffect()}`
+        );
+      }
+
+      return until;
+    },
+    /** The reset time without logging, for the next run calculation. */
+    current(): Date | null {
+      return rateLimitedUntil(key);
+    },
+  };
+}
+
+/**
+ * Bring the next run forward to just after the rate limit reset.
+ *
+ * Without this the run that stopped early would keep the schedule's own
+ * nextRun, so a daily cron would leave the remaining repositories untouched
+ * for a day even though the limit is back minutes later.
+ */
+async function persistRateLimitedNextRun(config: any, currentTime: Date, resetAt: Date): Promise<Date> {
+  const scheduleConfig = config.scheduleConfig || {};
+  const nextRun = new Date(resetAt.getTime() + RATE_LIMIT_RESUME_MARGIN_MS);
+
+  await db.update(configs).set({
+    scheduleConfig: {
+      ...scheduleConfig,
+      lastRun: currentTime,
+      nextRun,
+    },
+    updatedAt: new Date(),
+  }).where(eq(configs.id, config.id));
+
+  console.log(
+    `[Scheduler] Next sync for user ${config.userId} moved to ${nextRun.toISOString()} to resume after the rate limit reset`
+  );
+
+  return nextRun;
+}
+
+/**
+ * Put a repository back to the status it had before an attempt that only
+ * failed because of a rate limit.
+ *
+ * The mirror and sync paths write "failed" on any error, which leaves the row
+ * waiting for a manual retry. A rate limit is not a repository failure, and
+ * the scheduler already re-syncs "failed", "mirrored", "synced" and "pending"
+ * rows, so restoring the previous status is enough for the run after the reset
+ * to pick the repository up on its own.
+ */
+async function restoreRepositoryAfterRateLimit(
+  repo: { id: string; fullName: string; status: string },
+  phase: string
+): Promise<void> {
+  try {
+    await db.update(repositories).set({
+      status: repo.status,
+      updatedAt: new Date(),
+    }).where(eq(repositories.id, repo.id));
+
+    console.warn(
+      `[Scheduler] ${repo.fullName} hit the source rate limit during ${phase}; ` +
+      `left it as "${repo.status}" so it is retried after the reset instead of needing a manual retry`
+    );
+  } catch (error) {
+    console.error(`[Scheduler] Failed to restore the status of ${repo.fullName} after a rate limit:`, error);
+  }
+}
+
+/**
+ * Auto-discovery: import new repositories from every enabled source. Shared
+ * by the scheduled-sync phase and the boot auto-start phase. A failing
+ * source is logged and skipped so the others still import.
+ */
+async function importRepositoriesFromSources(
+  config: any,
+  userId: string,
+  phase: 'scheduled sync' | 'auto-start'
+): Promise<void> {
+  const { listSources, ensureSourcesFromConfig, decryptSourceToken } = await import('@/lib/sources');
+  const { createSourceProviderFromSource } = await import('@/lib/source-providers');
+  // Configs written outside the sources API must still import: seed the
+  // first source row when the config carries connection fields but no
+  // source exists yet.
+  await ensureSourcesFromConfig(userId);
+  const sources = (await listSources(userId)).filter(source => source.enabled);
+
+  // Per-organization fork pins, so orgs opted out of forks stay that way
+  // during auto import. Loaded once; the pins apply to every source.
+  const orgForkOverrides = await loadOrganizationForkPolicies({ userId });
+
+  const existingRepos = await db
+    .select({
+      normalizedFullName: repositories.normalizedFullName,
+      sourceProvider: repositories.sourceProvider,
+      sourceUrl: repositories.sourceUrl,
+    })
+    .from(repositories)
+    .where(eq(repositories.userId, userId));
+  // A repository is identified by its host and full name, not by the source
+  // row that found it. Two sources can point at the same host (a personal
+  // token and a public-only source, both github.com), and a repository the
+  // user already tracks must not be inserted a second time under the other
+  // source: both rows would mirror to the same destination repository.
+  const existingRepoKeys = repositoryIdentityKeys(existingRepos);
+
+  for (const source of sources) {
+    try {
+      // A public-only source has no token, so the personal user/starred
+      // listings would 401 on every call. Its organizations are picked up
+      // by rediscoverOrganizationRepositories instead.
+      if (decryptSourceToken(source.token) === "") {
+        console.log(`[Scheduler] Source ${source.name} for user ${userId} is a public-only source: skipping personal discovery`);
+        continue;
+      }
+
+      const sourceProvider = createSourceProviderFromSource(source, { userId });
+
+      const [basicAndForkedRepos, starredRepos] = await Promise.all([
+        sourceProvider.listRepositories(config, { orgForkOverrides }),
+        config.githubConfig?.includeStarred
+          ? sourceProvider.listStarredRepositories(config)
+          : Promise.resolve([]),
+      ]);
+      const allGithubRepos = mergeGitReposPreferStarred(basicAndForkedRepos, starredRepos);
+      const mirrorableGithubRepos = allGithubRepos.filter(isMirrorableGitHubRepo);
+
+      const candidates = mirrorableGithubRepos.map(repo =>
+        normalizeGitRepoToInsert(repo, { userId, configId: config.id, sourceId: source.id })
+      );
+      const { fresh: reposToInsert, alreadyTracked } = selectNewRepositoriesByIdentity(
+        candidates,
+        existingRepoKeys
+      );
+      const newRepos = reposToInsert;
+      if (alreadyTracked.length > 0) {
+        console.log(`[Scheduler] ${alreadyTracked.length} repositories listed by source ${source.name} are already tracked for user ${userId} on the same host; not adding them again`);
+      }
+
+      if (newRepos.length > 0) {
+        console.log(`[Scheduler] Found ${newRepos.length} new repositories for user ${userId} on source ${source.name}`);
+
+        // Batch insert to avoid SQLite parameter limit
+        const sample = reposToInsert[0];
+        const columnCount = Object.keys(sample ?? {}).length || 1;
+        const BATCH_SIZE = calcBatchSizeForInsert(columnCount);
+        for (let i = 0; i < reposToInsert.length; i += BATCH_SIZE) {
+          const batch = reposToInsert.slice(i, i + BATCH_SIZE);
+          await db
+            .insert(repositories)
+            .values(batch)
+            .onConflictDoNothing({ target: [repositories.userId, repositories.sourceId, repositories.normalizedFullName] });
+        }
+        console.log(`[Scheduler] Successfully imported ${newRepos.length} new repositories for user ${userId} from source ${source.name}`);
+
+        // New repository notifications (settings > notifications). The
+        // notifyOnNewRepo master switch gates them and the own/organization/
+        // starred sub-switches select the groups; every group produces one alert
+        // instead of one per repository.
+        // Starred repositories always share a single group because their owners
+        // are arbitrary. Fire-and-forget: the service swallows every error, and
+        // a failing provider must not break the run.
+        const newReposByGroup = new Map<string, { kind: 'own' | 'organization'; label: string; names: string[] }>();
+        const starredRepoNames: string[] = [];
+        for (const repo of newRepos) {
+          if (repo.isStarred) {
+            starredRepoNames.push(repo.fullName);
+            continue;
+          }
+          const kind: 'own' | 'organization' = repo.organization ? 'organization' : 'own';
+          const label = repo.organization || repo.owner || 'Unknown';
+          const groupKey = `${kind}:${label}`;
+          const group = newReposByGroup.get(groupKey) ?? { kind, label, names: [] };
+          group.names.push(repo.fullName);
+          newReposByGroup.set(groupKey, group);
+        }
+        for (const group of newReposByGroup.values()) {
+          triggerNewRepositoriesNotification({
+            userId,
+            kind: group.kind,
+            groupLabel: group.label,
+            repositoryNames: group.names,
+            details: `Auto-imported during ${phase} from source ${source.name}.`,
+          }).catch(notificationError => {
+            console.error(`[Scheduler] Failed to send the new repository notification for ${group.label}:`, notificationError);
+          });
+        }
+        if (starredRepoNames.length > 0) {
+          triggerNewRepositoriesNotification({
+            userId,
+            kind: 'starred',
+            repositoryNames: starredRepoNames,
+            details: `Auto-imported during ${phase} from source ${source.name}.`,
+          }).catch(notificationError => {
+            console.error('[Scheduler] Failed to send the starred repository notification:', notificationError);
+          });
+        }
+
+        for (const repo of newRepos) {
+          const sourceLabel = repo.isStarred ? 'starred' : 'owned';
+          await createMirrorJob({
+            userId,
+            repositoryName: repo.fullName,
+            message: `Auto-imported ${sourceLabel} repository: ${repo.fullName}`,
+            details: `Repository ${repo.fullName} was discovered and imported during ${phase}.`,
+            status: 'imported',
+            skipDuplicateEvent: true,
+          });
+        }
+      } else {
+        console.log(`[Scheduler] No new repositories found for user ${userId} on source ${source.name}`);
+      }
+      const skippedDisabledCount = allGithubRepos.length - mirrorableGithubRepos.length;
+      if (skippedDisabledCount > 0) {
+        console.log(`[Scheduler] Skipped ${skippedDisabledCount} disabled repositories for user ${userId} on source ${source.name}`);
+      }
+    } catch (sourceError) {
+      console.error(`[Scheduler] Failed to import repositories from source ${source.name} for user ${userId} during ${phase}:`, sourceError);
+    }
+  }
+}
+
+/**
+ * Re-discover organization repositories: each tick re-lists every included
+ * organization whose pin resolves to an existing enabled source and inserts
+ * the repositories it does not have yet. The per-organization work lives in
+ * rediscoverRepositoriesForOrganization, which the manual organization sync
+ * route shares.
+ */
+async function rediscoverOrganizationRepositories(
+  config: any,
+  userId: string,
+  phase: 'scheduled sync' | 'auto-start'
+): Promise<void> {
+  const { listSources } = await import('@/lib/sources');
+  const sources = (await listSources(userId)).filter(source => source.enabled);
+
+  // An ignored organization is left alone entirely: rediscovering it would
+  // insert its new repositories as imported and auto-mirror could pick them
+  // up, which is what the user just asked to stop (#429).
+  const includedOrgs = await db
+    .select()
+    .from(organizations)
+    .where(
+      and(
+        eq(organizations.userId, userId),
+        eq(organizations.isIncluded, true),
+        ne(organizations.status, 'ignored')
+      )
+    );
+
+  // Same identity rule as personal discovery: an organization pinned to a
+  // public-only source must not re-insert repositories the personal source
+  // already tracks on the same host (or the other way round). One set is
+  // shared by every organization in the pass, so it also keeps two
+  // organizations from inserting the same repository twice.
+  const existingRepos = await db
+    .select({
+      normalizedFullName: repositories.normalizedFullName,
+      sourceProvider: repositories.sourceProvider,
+      sourceUrl: repositories.sourceUrl,
+    })
+    .from(repositories)
+    .where(eq(repositories.userId, userId));
+  const existingRepoKeys = repositoryIdentityKeys(existingRepos);
+
+  for (const org of includedOrgs) {
+    try {
+      await rediscoverRepositoriesForOrganization({
+        config,
+        userId,
+        organization: org,
+        sources,
+        existingRepoKeys,
+        phase,
+      });
+    } catch (orgError) {
+      console.error(`[Scheduler] Failed to re-discover repositories for organization ${org.name} for user ${userId} during ${phase}:`, orgError);
+    }
+  }
+}
+
+/**
+ * Resolve the GitHub API client for a repository's own source. Only GitHub
+ * sources need a client while mirroring (metadata); other hosts get
+ * code-only mirrors. Repositories whose source row no longer resolves keep
+ * the pre-multi-source behavior: the client built from the config, when the
+ * configured provider is GitHub. Clients are cached per source for the
+ * batch loop.
+ */
+async function createOctokitResolverForSources(
+  config: any,
+  userId: string,
+  sources: SourceRecord[]
+): Promise<(repo: { sourceId?: string | null }) => Promise<Octokit | null>> {
+  const { decryptSourceToken, resolveGitHubApiBaseUrl } = await import('@/lib/sources');
+  const { createGitHubClient, createPublicGitHubClient } = await import('@/lib/github');
+  const { createGitHubAppClient } = await import('@/lib/github-app-client');
+  const { isGitHubAppCredential } = await import('@/lib/github-app-credentials');
+
+  const sourcesById = new Map(sources.map(source => [source.id, source]));
+  const clientsBySourceId = new Map<string, Octokit | null>();
+  let configClient: Octokit | null | undefined;
+
+  return async (repo) => {
+    const source = sourcesById.get(repo.sourceId ?? '');
+    if (source) {
+      if (!clientsBySourceId.has(source.id)) {
+        if (source.provider === 'github') {
+          // A tokenless source still gets the anonymous public client
+          // (60 req/hr) so public-repo metadata mirrors; an empty token
+          // must never reach createGitHubClient, which would send
+          // `auth: ""` and 401 on every call.
+          const sourceToken = decryptSourceToken(source.token);
+          clientsBySourceId.set(
+            source.id,
+            isGitHubAppCredential(sourceToken)
+              ? createGitHubAppClient(sourceToken, { userId, apiBaseUrl: resolveGitHubApiBaseUrl(source.url) })
+              : sourceToken
+              ? createGitHubClient(
+                  sourceToken,
+                  userId,
+                  source.username,
+                  resolveGitHubApiBaseUrl(source.url)
+                )
+              : createPublicGitHubClient(resolveGitHubApiBaseUrl(source.url))
+          );
+        } else {
+          clientsBySourceId.set(source.id, null);
+        }
+      }
+      return clientsBySourceId.get(source.id) ?? null;
+    }
+
+    if (configClient === undefined) {
+      const { resolveSourceProviderKind } = await import('@/lib/source-providers');
+      if (resolveSourceProviderKind(config) === 'github') {
+        const configToken = getDecryptedGitHubToken(config);
+        configClient = isGitHubAppCredential(configToken)
+          ? createGitHubAppClient(configToken, {
+              userId,
+              apiBaseUrl: resolveGitHubApiBaseUrl(config.githubConfig?.url),
+            })
+          : createGitHubClient(configToken, userId, config.githubConfig?.owner);
+      } else {
+        configClient = null;
+      }
+    }
+    return configClient;
+  };
+}
+
+/**
+ * The lower-cased username of each source, for classifying starred repos by
+ * the owner of the repository's own source.
+ */
+function sourceUsernamesBySourceId(sources: SourceRecord[]): Map<string, string> {
+  return new Map(sources.map(source => [source.id, (source.username || '').toLowerCase()]));
+}
+
+/**
+ * Run scheduled mirror sync for a single user configuration
+ */
+/**
+ * Keep one row per upstream repository in a scheduler batch. Duplicate rows
+ * (the same repository imported under two sources on the same host) resolve
+ * to one destination repository, and processing both in one Promise.all ran
+ * every step twice against it. The dropped rows are logged so the duplicate
+ * can be cleaned up; discovery no longer creates new ones.
+ */
+function dropDuplicateRowsForPass<T extends { fullName: string; sourceId?: string | null; sourceProvider?: string | null; sourceUrl?: string | null; normalizedFullName: string }>(
+  rows: T[],
+  pass: string
+): T[] {
+  const { kept, dropped } = dedupeRepositoriesByIdentity(rows);
+  for (const row of dropped) {
+    console.warn(`[Scheduler] ${row.fullName} is tracked more than once (another row on the same host covers it); skipping the duplicate row in this ${pass} pass`);
+  }
+  return kept;
+}
+
+async function runScheduledSync(config: any): Promise<void> {
+  const userId = config.userId;
+  const rateLimit = createRateLimitWatcher(userId);
+  console.log(`[Scheduler] Running scheduled sync for user ${userId}`);
+  
+  try {
+    // Check that the destination is configured before proceeding. The
+    // source side may be a public-only (tokenless) source, so only the
+    // destination token is required here.
+    if (!config.giteaConfig?.token) {
+      console.log(`[Scheduler] Skipping sync for user ${userId}: Destination token not configured`);
+      return;
+    }
+
+    // Update lastRun timestamp
+    const currentTime = new Date();
+    const scheduleConfig = config.scheduleConfig || {};
+    const { source, timezone } = resolveScheduleSettings(config);
+    console.log(`[Scheduler] Using schedule source for user ${userId}: ${String(source)} (timezone=${timezone})`);
+    await persistScheduleRunState(config, currentTime);
+
+    // A rate limit left open by an earlier run (or by the boot auto-start)
+    // would fail every source call here. Skip the whole run and come back
+    // just after the reset instead of burning a tick on failures.
+    const pausedAtStart = rateLimit.check(() => 'skipping this run');
+    if (pausedAtStart) {
+      await persistRateLimitedNextRun(config, currentTime, pausedAtStart);
+      return;
+    }
+
+    // Auto-discovery: Check for new repositories on every enabled source
+    if (scheduleConfig.autoImport !== false) {
+      console.log(`[Scheduler] Checking for new source repositories for user ${userId}...`);
+      try {
+        await importRepositoriesFromSources(config, userId, 'scheduled sync');
+      } catch (error) {
+        console.error(`[Scheduler] Failed to auto-import repositories for user ${userId}:`, error);
+      }
+      // Organizations pinned to a source can gain newly published upstream
+      // repositories at any time; re-list them so the next mirror picks
+      // them up. A failure must not block the rest of the sync.
+      try {
+        await rediscoverOrganizationRepositories(config, userId, 'scheduled sync');
+      } catch (error) {
+        console.error(`[Scheduler] Failed to re-discover organization repositories for user ${userId}:`, error);
+      }
+    }
+    
+    // Auto-cleanup: Remove orphaned repositories (repos that no longer exist in GitHub)
+    if (config.cleanupConfig?.deleteIfNotInGitHub) {
+      console.log(`[Scheduler] Checking for orphaned repositories to cleanup for user ${userId}...`);
+      try {
+        const { identifyOrphanedRepositories, handleOrphanedRepository } = await import('@/lib/repository-cleanup-service');
+        
+        const orphanedRepos = await identifyOrphanedRepositories(config);
+        
+        if (orphanedRepos.length > 0) {
+          console.log(`[Scheduler] Found ${orphanedRepos.length} orphaned repositories for cleanup`);
+          
+          for (const repo of orphanedRepos) {
+            try {
+              await handleOrphanedRepository(
+                config,
+                repo,
+                config.cleanupConfig.orphanedRepoAction || 'archive',
+                config.cleanupConfig.dryRun ?? false
+              );
+              console.log(`[Scheduler] Handled orphaned repository: ${repo.fullName}`);
+            } catch (error) {
+              console.error(`[Scheduler] Failed to handle orphaned repository ${repo.fullName}:`, error);
+            }
+          }
+        } else {
+          console.log(`[Scheduler] No orphaned repositories found for cleanup`);
+        }
+      } catch (error) {
+        console.error(`[Scheduler] Failed to cleanup orphaned repositories for user ${userId}:`, error);
+      }
+    }
+    
+    // Auto-mirror: Mirror imported/pending/failed repositories if enabled.
+    // autoMirror covers owned repos; autoMirrorStarred covers starred repos from other owners.
+    // Either flag on its own is enough to enter this phase.
+    const autoMirrorOwned = !!scheduleConfig.autoMirror;
+    const autoMirrorStarred = !!config.githubConfig?.autoMirrorStarred;
+    if (autoMirrorOwned || autoMirrorStarred) {
+      try {
+        console.log(`[Scheduler] Auto-mirror enabled (owned=${autoMirrorOwned}, starred=${autoMirrorStarred}) - checking for repositories to mirror for user ${userId}...`);
+        let reposNeedingMirror = await db
+          .select()
+          .from(repositories)
+          .where(
+            and(
+              eq(repositories.userId, userId),
+              or(
+                eq(repositories.status, 'imported'),
+                eq(repositories.status, 'pending'),
+                eq(repositories.status, 'failed')
+              )
+            )
+          );
+
+        const { listSources, findSourceForRepository } = await import('@/lib/sources');
+        const userSources = await listSources(userId);
+        const usernameBySourceId = sourceUsernamesBySourceId(userSources);
+        const configOwner = (config.githubConfig?.owner || '').toLowerCase();
+        const beforeCount = reposNeedingMirror.length;
+        reposNeedingMirror = reposNeedingMirror.filter(repo => {
+          // Starred repos are classified by the owner of the repository's own
+          // source; rows without a resolvable source keep the configured
+          // owner, as before multiple sources. Usernames are lower-cased on
+          // both sides because they are case-insensitive.
+          const sourceOwner =
+            usernameBySourceId.get(repo.sourceId ?? '') ??
+            findSourceForRepository(repo, userSources)?.username.toLowerCase() ??
+            configOwner;
+          const isStarredFromOther = repo.isStarred && repo.owner.toLowerCase() !== sourceOwner;
+          return isStarredFromOther ? autoMirrorStarred : autoMirrorOwned;
+        });
+        const skippedCount = beforeCount - reposNeedingMirror.length;
+        if (skippedCount > 0) {
+          console.log(`[Scheduler] Skipped ${skippedCount} repositories from auto-mirror (autoMirror=${autoMirrorOwned}, autoMirrorStarred=${autoMirrorStarred})`);
+        }
+
+        // Organization fork policies apply to already-imported rows too, so a
+        // fork that slipped in before its org opted out is not auto-mirrored.
+        const orgForkOverrides = await loadOrganizationForkPolicies({ userId });
+        const forkSkipFor = orgForkSkipDecision(orgForkOverrides, config);
+        const forkSkippedCount = reposNeedingMirror.length;
+        reposNeedingMirror = reposNeedingMirror.filter(
+          repo => !repo.isForked || !repo.organization || !forkSkipFor(repo.organization)
+        );
+        if (reposNeedingMirror.length !== forkSkippedCount) {
+          console.log(`[Scheduler] Skipped ${forkSkippedCount - reposNeedingMirror.length} forked repositories from auto-mirror (organization skip forks)`);
+        }
+
+        // Two rows for one upstream repository (imported under two sources
+        // that point at the same host) resolve to one destination
+        // repository; mirror it once per pass, not twice at the same time.
+        reposNeedingMirror = dropDuplicateRowsForPass(reposNeedingMirror, 'auto-mirror');
+
+        if (reposNeedingMirror.length > 0) {
+          console.log(`[Scheduler] Found ${reposNeedingMirror.length} repositories that need initial mirroring`);
+
+          // Each repository is mirrored with the API client of its own source.
+          const resolveOctokit = await createOctokitResolverForSources(config, userId, userSources);
+
+          // Process repositories in batches
+          const batchSize = scheduleConfig.batchSize || 10;
+          const pauseBetweenBatches = scheduleConfig.pauseBetweenBatches || 2000;
+          for (let i = 0; i < reposNeedingMirror.length; i += batchSize) {
+            const remaining = reposNeedingMirror.length - i;
+            if (rateLimit.check(() => `leaving ${remaining} repositories to auto-mirror on the next run`)) {
+              break;
+            }
+
+            const batch = reposNeedingMirror.slice(i, Math.min(i + batchSize, reposNeedingMirror.length));
+            console.log(`[Scheduler] Auto-mirror batch ${Math.floor(i / batchSize) + 1} of ${Math.ceil(reposNeedingMirror.length / batchSize)} (${batch.length} repos)`);
+
+            await Promise.all(
+              batch.map(async (repo) => {
+                if (rateLimit.check(() => `leaving ${remaining} repositories to auto-mirror on the next run`)) {
+                  return;
+                }
+
+                try {
+                  const repository: Repository = {
+                    ...repo,
+                    status: repoStatusEnum.parse(repo.status),
+                    organization: repo.organization ?? undefined,
+                    lastMirrored: repo.lastMirrored ?? undefined,
+                    errorMessage: repo.errorMessage ?? undefined,
+                    mirroredLocation: repo.mirroredLocation || '',
+                    forkedFrom: repo.forkedFrom ?? undefined,
+                    visibility: repositoryVisibilityEnum.parse(repo.visibility),
+                  };
+
+                  // A `failed` repo whose recorded location still resolves to a
+                  // live same-source mirror (e.g. migrate succeeded but metadata
+                  // failed) must be SYNCED, not re-created — otherwise the
+                  // re-create loop spawns suffixed duplicates (#315). The create
+                  // path also reuses now, but routing to sync here avoids a
+                  // wasted migrate attempt and keeps recovery cheap.
+                  if (repo.status === 'failed' && repository.mirroredLocation && !usesPushEngine(config)) {
+                    const { findExistingMirror } = await import('@/lib/utils/mirror-source-match');
+                    const existing = await findExistingMirror({
+                      repository,
+                      config,
+                      candidateOwner: repository.mirroredLocation.split('/')[0] || '',
+                      candidateName: repository.name,
+                    });
+                    if (existing) {
+                      await syncRepositoryOnDestination({ config, repository });
+                      console.log(`[Scheduler] Re-synced failed repository with live mirror: ${repo.fullName}`);
+                      return;
+                    }
+                  }
+
+                  await mirrorRepositoryToDestination({ octokit: await resolveOctokit(repo), repository, config });
+                  console.log(`[Scheduler] Auto-mirrored repository: ${repo.fullName}`);
+                } catch (error) {
+                  if (isRateLimitError(error)) {
+                    await restoreRepositoryAfterRateLimit(repo, 'auto-mirror');
+                    return;
+                  }
+                  console.error(`[Scheduler] Failed to auto-mirror repository ${repo.fullName}:`, error);
+                }
+              })
+            );
+
+            // Pause between batches if configured
+            if (i + batchSize < reposNeedingMirror.length) {
+              console.log(`[Scheduler] Pausing for ${pauseBetweenBatches}ms before next auto-mirror batch...`);
+              await new Promise(resolve => setTimeout(resolve, pauseBetweenBatches));
+            }
+          }
+        } else {
+          console.log(`[Scheduler] No repositories need initial mirroring`);
+        }
+      } catch (mirrorError) {
+        console.error(`[Scheduler] Error during auto-mirror phase for user ${userId}:`, mirrorError);
+      }
+    }
+
+    // Get repositories to sync
+    let reposToSync = await db
+      .select()
+      .from(repositories)
+      .where(
+        and(
+          eq(repositories.userId, userId),
+          or(
+            eq(repositories.status, 'mirrored'),
+            eq(repositories.status, 'synced'),
+            eq(repositories.status, 'failed'),
+            eq(repositories.status, 'pending')
+          )
+        )
+      );
+    
+    // Filter based on schedule configuration
+    if (scheduleConfig.skipRecentlyMirrored) {
+      const recentThreshold = scheduleConfig.recentThreshold || 3600000; // Default 1 hour
+      const thresholdTime = new Date(currentTime.getTime() - recentThreshold);
+      
+      reposToSync = reposToSync.filter(repo => {
+        if (!repo.lastMirrored) return true; // Never mirrored
+        return repo.lastMirrored < thresholdTime;
+      });
+    }
+    
+    if (scheduleConfig.onlyMirrorUpdated) {
+      const updateInterval = scheduleConfig.updateInterval || 86400000; // Default 24 hours
+      const updateThreshold = new Date(currentTime.getTime() - updateInterval);
+      
+      // Check GitHub for updates (this would need to be implemented)
+      // For now, we'll sync repos that haven't been synced in the update interval
+      reposToSync = reposToSync.filter(repo => {
+        if (!repo.lastMirrored) return true;
+        return repo.lastMirrored < updateThreshold;
+      });
+    }
+    
+    // Log pending-approval repos that are excluded from sync
+    try {
+      const pendingApprovalRepos = await db
+        .select({ id: repositories.id })
+        .from(repositories)
+        .where(
+          and(
+            eq(repositories.userId, userId),
+            eq(repositories.status, 'pending-approval')
+          )
+        );
+      if (pendingApprovalRepos.length > 0) {
+        console.log(`[Scheduler] ${pendingApprovalRepos.length} repositories pending approval (force-push detected) for user ${userId} — skipping sync for those`);
+      }
+    } catch {
+      // Non-critical logging, ignore errors
+    }
+
+    reposToSync = dropDuplicateRowsForPass(reposToSync, 'sync');
+
+    if (reposToSync.length === 0) {
+      console.log(`[Scheduler] No repositories to sync for user ${userId}`);
+      const pausedAfterMirror = rateLimit.current();
+      if (pausedAfterMirror) {
+        await persistRateLimitedNextRun(config, currentTime, pausedAfterMirror);
+      }
+      return;
+    }
+
+    console.log(`[Scheduler] Syncing ${reposToSync.length} repositories for user ${userId}`);
+    
+    // Process repositories in batches
+    const batchSize = scheduleConfig.batchSize || 10;
+    const pauseBetweenBatches = scheduleConfig.pauseBetweenBatches || 5000;
+    const concurrent = scheduleConfig.concurrent ?? false;
+    
+    syncBatches: for (let i = 0; i < reposToSync.length; i += batchSize) {
+      if (rateLimit.check(() => `leaving ${reposToSync.length - i} repositories to sync on the next run`)) {
+        break;
+      }
+
+      const batch = reposToSync.slice(i, i + batchSize);
+      
+      if (concurrent) {
+        // Process batch concurrently
+        await Promise.allSettled(
+          batch.map(repo => syncSingleRepository(config, repo))
+        );
+      } else {
+        // Process batch sequentially
+        for (let j = 0; j < batch.length; j++) {
+          if (rateLimit.check(() => `leaving ${reposToSync.length - i - j} repositories to sync on the next run`)) {
+            break syncBatches;
+          }
+          await syncSingleRepository(config, batch[j]);
+        }
+      }
+      
+      // Pause between batches if not the last batch
+      if (i + batchSize < reposToSync.length) {
+        await new Promise(resolve => setTimeout(resolve, pauseBetweenBatches));
+      }
+    }
+
+    // A run that stopped on the rate limit comes back just after the reset,
+    // not at the schedule's own next slot, so the repositories it left behind
+    // are not held for a whole cron period.
+    const pausedUntil = rateLimit.current();
+    if (pausedUntil) {
+      await persistRateLimitedNextRun(config, currentTime, pausedUntil);
+      return;
+    }
+
+    console.log(`[Scheduler] Completed scheduled sync for user ${userId}`);
+  } catch (error) {
+    console.error(`[Scheduler] Error during scheduled sync for user ${userId}:`, error);
+  }
+}
+
+/**
+ * Sync a single repository
+ */
+async function syncSingleRepository(config: any, repo: any): Promise<void> {
+  try {
+    const repository: Repository = {
+      ...repo,
+      status: repoStatusEnum.parse(repo.status),
+      organization: repo.organization ?? undefined,
+      lastMirrored: repo.lastMirrored ?? undefined,
+      errorMessage: repo.errorMessage ?? undefined,
+      mirroredLocation: repo.mirroredLocation || '',
+      forkedFrom: repo.forkedFrom ?? undefined,
+      visibility: repositoryVisibilityEnum.parse(repo.visibility),
+    };
+    
+    await syncRepositoryOnDestination({ config, repository });
+    console.log(`[Scheduler] Successfully synced repository ${repo.fullName}`);
+  } catch (error) {
+    // The sync path claimed the row as "syncing" and the failure handler below
+    // it wrote "failed". A rate limit is not the repository's fault, so put the
+    // row back where it was and let the run after the reset retry it.
+    if (isRateLimitError(error)) {
+      await restoreRepositoryAfterRateLimit(repo, 'sync');
+      return;
+    }
+
+    console.error(`[Scheduler] Failed to sync repository ${repo.fullName}:`, error);
+    
+    // Update repository status to failed
+    await db.update(repositories).set({
+      status: 'failed',
+      errorMessage: error instanceof Error ? error.message : 'Unknown error',
+      updatedAt: new Date(),
+    }).where(eq(repositories.id, repo.id));
+  }
+}
+
+/**
+ * Check if we should auto-start based on environment configuration
+ */
+async function checkAutoStartConfiguration(): Promise<boolean> {
+  // Don't auto-start more than once
+  if (hasPerformedAutoStart) {
+    return false;
+  }
+  
+  try {
+    // Check if any configuration has scheduling enabled or mirror interval set
+    const activeConfigs = await db
+      .select()
+      .from(configs)
+      .where(eq(configs.isActive, true));
+    
+    for (const config of activeConfigs) {
+      // Check if scheduling is enabled.
+      // Note: env-config-loader already sets scheduleConfig.enabled=true when
+      // GITEA_MIRROR_INTERVAL is set at startup, so the enabled flag is the
+      // single authoritative gate here. Checking hasMirrorInterval directly
+      // would allow a configured interval to trigger auto-start even after the
+      // user explicitly disabled scheduling via the UI.
+      const scheduleEnabled = config.scheduleConfig?.enabled === true;
+
+      if (scheduleEnabled) {
+        console.log(`[Scheduler] Auto-start conditions met for user ${config.userId} (scheduleEnabled=${scheduleEnabled})`);
+        return true;
+      }
+    }
+    
+    return false;
+  } catch (error) {
+    console.error('[Scheduler] Error checking auto-start configuration:', error);
+    return false;
+  }
+}
+
+/**
+ * Perform initial auto-start: import repositories and trigger mirror
+ */
+async function performInitialAutoStart(): Promise<void> {
+  hasPerformedAutoStart = true;
+  
+  try {
+    console.log('[Scheduler] Performing initial auto-start...');
+    
+    // Get all active configurations
+    const activeConfigs = await db
+      .select()
+      .from(configs)
+      .where(eq(configs.isActive, true));
+    
+    for (const config of activeConfigs) {
+      // Skip when the destination is not configured. Tokenless public
+      // sources start too; personal discovery skips them on its own.
+      if (!config.giteaConfig?.token) {
+        console.log(`[Scheduler] Skipping auto-start for user ${config.userId}: destination token not configured`);
+        continue;
+      }
+      
+      const scheduleEnabled = config.scheduleConfig?.enabled === true;
+
+      // Only process configs where scheduling is explicitly enabled.
+      // env-config-loader already sets enabled=true when GITEA_MIRROR_INTERVAL
+      // is present, so this single check covers both the UI toggle and the
+      // env-var boot path without letting a bare interval override a disabled toggle.
+      if (!scheduleEnabled) {
+        continue;
+      }
+      
+      console.log(`[Scheduler] Auto-starting for user ${config.userId}...`);
+      
+      // Auto-start runs outside the scheduler lock, but it mirrors the same
+      // repositories and must stop on a rate limit too: otherwise it keeps
+      // failing every repository in turn and hands the scheduler a pile of
+      // rows marked "failed" (issue #437).
+      const rateLimit = createRateLimitWatcher(config.userId);
+
+      try {
+        // Step 1: Import repositories from every enabled source
+        console.log(`[Scheduler] Step 1: Importing repositories from the configured sources for user ${config.userId}...`);
+        await importRepositoriesFromSources(config, config.userId, 'auto-start');
+
+        // Check if we already have mirrored repositories (indicating this isn't first run)
+        const mirroredRepos = await db
+          .select()
+          .from(repositories)
+          .where(
+            and(
+              eq(repositories.userId, config.userId),
+              or(
+                eq(repositories.status, 'mirrored'),
+                eq(repositories.status, 'synced')
+              )
+            )
+          )
+          .limit(1);
+        
+        // If we already have mirrored repos, skip the initial mirror (let regular sync handle it)
+        if (mirroredRepos.length > 0) {
+          console.log(`[Scheduler] User ${config.userId} already has mirrored repositories, skipping initial mirror (let regular sync handle updates)`);
+          
+          // Still update the schedule config to indicate scheduling is active
+          const currentTime = new Date();
+          const nextRun = await persistScheduleRunState(config, currentTime, true);
+          console.log(`[Scheduler] Scheduling enabled for user ${config.userId}, next sync at ${nextRun.toISOString()}`);
+          continue;
+        }
+        
+        // Step 2: Trigger mirror for all repositories that need mirroring.
+        // autoMirror covers owned repos; autoMirrorStarred covers starred repos from other owners.
+        const autoMirrorOwned = !!config.scheduleConfig?.autoMirror;
+        const autoMirrorStarred = !!config.githubConfig?.autoMirrorStarred;
+        if (!autoMirrorOwned && !autoMirrorStarred) {
+          console.log(`[Scheduler] Step 2: Skipping initial mirror - autoMirror and autoMirrorStarred are both disabled for user ${config.userId}`);
+
+          // Still update schedule config timestamps
+          const currentTime2 = new Date();
+          const nextRun2 = await persistScheduleRunState(config, currentTime2, true);
+
+          console.log(`[Scheduler] Scheduling enabled for user ${config.userId}, next sync at ${nextRun2.toISOString()}`);
+          continue;
+        }
+
+        console.log(`[Scheduler] Step 2: Triggering mirror for repositories that need mirroring (owned=${autoMirrorOwned}, starred=${autoMirrorStarred})...`);
+        let reposNeedingMirror = await db
+          .select()
+          .from(repositories)
+          .where(
+            and(
+              eq(repositories.userId, config.userId),
+              or(
+                eq(repositories.status, 'imported'),
+                eq(repositories.status, 'pending'),
+                eq(repositories.status, 'failed')
+              )
+            )
+          );
+
+        const { listSources, findSourceForRepository } = await import('@/lib/sources');
+        const userSources = await listSources(config.userId);
+        const usernameBySourceId = sourceUsernamesBySourceId(userSources);
+        const configOwner = (config.githubConfig?.owner || '').toLowerCase();
+        const beforeCount = reposNeedingMirror.length;
+        reposNeedingMirror = reposNeedingMirror.filter(repo => {
+          // Starred repos are classified by the owner of the repository's own
+          // source; rows without a resolvable source keep the configured
+          // owner, as before multiple sources. Usernames are lower-cased on
+          // both sides because they are case-insensitive.
+          const sourceOwner =
+            usernameBySourceId.get(repo.sourceId ?? '') ??
+            findSourceForRepository(repo, userSources)?.username.toLowerCase() ??
+            configOwner;
+          const isStarredFromOther = repo.isStarred && repo.owner.toLowerCase() !== sourceOwner;
+          return isStarredFromOther ? autoMirrorStarred : autoMirrorOwned;
+        });
+        const skippedCount = beforeCount - reposNeedingMirror.length;
+        if (skippedCount > 0) {
+          console.log(`[Scheduler] Skipped ${skippedCount} repositories from initial auto-mirror (autoMirror=${autoMirrorOwned}, autoMirrorStarred=${autoMirrorStarred})`);
+        }
+        reposNeedingMirror = dropDuplicateRowsForPass(reposNeedingMirror, 'initial auto-mirror');
+
+        if (reposNeedingMirror.length > 0) {
+          console.log(`[Scheduler] Found ${reposNeedingMirror.length} repositories that need mirroring`);
+
+          // Each repository is mirrored with the API client of its own source.
+          const resolveOctokit = await createOctokitResolverForSources(config, config.userId, userSources);
+
+          // Process repositories in batches
+          const batchSize = config.scheduleConfig?.batchSize || 5;
+          for (let i = 0; i < reposNeedingMirror.length; i += batchSize) {
+            const remaining = reposNeedingMirror.length - i;
+            if (rateLimit.check(() => `leaving ${remaining} repositories for the first scheduled run`)) {
+              break;
+            }
+
+            const batch = reposNeedingMirror.slice(i, Math.min(i + batchSize, reposNeedingMirror.length));
+            console.log(`[Scheduler] Processing batch ${Math.floor(i / batchSize) + 1} of ${Math.ceil(reposNeedingMirror.length / batchSize)} (${batch.length} repos)`);
+
+            await Promise.all(
+              batch.map(async (repo) => {
+                if (rateLimit.check(() => `leaving ${remaining} repositories for the first scheduled run`)) {
+                  return;
+                }
+
+                try {
+                  const repository: Repository = {
+                    ...repo,
+                    status: repoStatusEnum.parse(repo.status),
+                    organization: repo.organization ?? undefined,
+                    lastMirrored: repo.lastMirrored ?? undefined,
+                    errorMessage: repo.errorMessage ?? undefined,
+                    mirroredLocation: repo.mirroredLocation || '',
+                    forkedFrom: repo.forkedFrom ?? undefined,
+                    visibility: repositoryVisibilityEnum.parse(repo.visibility),
+                  };
+
+                  await mirrorRepositoryToDestination({
+                    octokit: await resolveOctokit(repo),
+                    repository,
+                    config
+                  });
+                  console.log(`[Scheduler] Successfully mirrored repository: ${repo.fullName}`);
+                } catch (error) {
+                  if (isRateLimitError(error)) {
+                    await restoreRepositoryAfterRateLimit(repo, 'auto-start mirror');
+                    return;
+                  }
+                  console.error(`[Scheduler] Failed to mirror repository ${repo.fullName}:`, error);
+                }
+              })
+            );
+            
+            // Pause between batches if configured
+            if (i + batchSize < reposNeedingMirror.length) {
+              const pauseTime = config.scheduleConfig?.pauseBetweenBatches || 2000;
+              console.log(`[Scheduler] Pausing for ${pauseTime}ms before next batch...`);
+              await new Promise(resolve => setTimeout(resolve, pauseTime));
+            }
+          }
+          
+          console.log(`[Scheduler] Completed initial mirror for ${reposNeedingMirror.length} repositories`);
+        } else {
+          console.log(`[Scheduler] No repositories need mirroring`);
+        }
+        
+        // Update the schedule config to indicate we've run
+        const currentTime = new Date();
+        let nextRun = await persistScheduleRunState(config, currentTime, true);
+
+        // A rate limit that stopped the initial mirror also moves the first
+        // scheduled run to just after the reset, so the repositories left
+        // behind are not held for a whole schedule period.
+        const pausedUntil = rateLimit.current();
+        if (pausedUntil) {
+          nextRun = await persistRateLimitedNextRun(config, currentTime, pausedUntil);
+        }
+
+        console.log(`[Scheduler] Auto-start completed for user ${config.userId}, next sync at ${nextRun.toISOString()}`);
+        
+      } catch (error) {
+        console.error(`[Scheduler] Failed to auto-start for user ${config.userId}:`, error);
+      }
+    }
+    
+    console.log('[Scheduler] Initial auto-start completed');
+  } catch (error) {
+    console.error('[Scheduler] Failed to perform initial auto-start:', error);
+  }
+}
+
+/**
+ * Main scheduler loop. Exported for the behavioral test suite, which drives
+ * one loop iteration against mocked sources in an isolated process.
+ */
+export async function schedulerLoop(): Promise<void> {
+  if (isSchedulerRunning) {
+    console.log('[Scheduler] Scheduler is already running, skipping this cycle');
+    return;
+  }
+  
+  isSchedulerRunning = true;
+
+  try {
+    // Heal repositories/organizations stuck in an in-flight status
+    // ("mirroring"/"syncing") from a crash or restart (issue #339). Runs on
+    // every tick, before the enabled-config filtering, so stuck rows are
+    // reset even for users without scheduling enabled. Never throws.
+    const stuckReset = await resetStuckMirrorStatuses();
+    if (stuckReset.repositories > 0 || stuckReset.organizations > 0) {
+      console.log(
+        `[Scheduler] Reset ${stuckReset.repositories} stuck repositor${stuckReset.repositories === 1 ? 'y' : 'ies'} ` +
+        `and ${stuckReset.organizations} stuck organization(s) from in-flight status to "failed"`
+      );
+    }
+
+    // Get all active configurations with scheduling enabled
+    const activeConfigs = await db
+      .select()
+      .from(configs)
+      .where(
+        and(
+          eq(configs.isActive, true)
+        )
+      );
+    
+    const enabledConfigs = activeConfigs.filter(config => 
+      config.scheduleConfig?.enabled === true
+    );
+    
+    // Further filter configs that have a valid destination token. The
+    // source side may be a public-only (tokenless) source, so only the
+    // destination token is required.
+    const validConfigs = enabledConfigs.filter(config => {
+      const hasDestinationToken = !!config.giteaConfig?.token;
+
+      if (!hasDestinationToken) {
+        console.log(`[Scheduler] User ${config.userId}: Scheduling enabled but destination token not configured`);
+        return false;
+      }
+      return true;
+    });
+
+    if (validConfigs.length === 0) {
+      if (enabledConfigs.length > 0) {
+        console.log(`[Scheduler] ${enabledConfigs.length} config(s) have scheduling enabled but lack the destination token`);
+      } else {
+        console.log(`[Scheduler] No configurations with scheduling enabled (found ${activeConfigs.length} active configs)`);
+        
+        // Show details about why configs are not enabled
+        activeConfigs.forEach(config => {
+          const scheduleEnabled = config.scheduleConfig?.enabled;
+          const mirrorInterval = config.giteaConfig?.mirrorInterval;
+          console.log(`[Scheduler] User ${config.userId}: scheduleEnabled=${scheduleEnabled}, mirrorInterval=${mirrorInterval}`);
+        });
+      }
+      
+      return;
+    }
+    
+    console.log(`[Scheduler] Processing ${validConfigs.length} valid configurations (out of ${enabledConfigs.length} with scheduling enabled)`);
+    
+    // Check each configuration to see if it's time to run
+    const currentTime = new Date();
+    
+    for (const config of validConfigs) {
+      const scheduleConfig = config.scheduleConfig || {};
+      const { source, timezone } = resolveScheduleSettings(config);
+
+      // For clock-based schedules, initialize nextRun instead of running immediately.
+      if (!scheduleConfig.nextRun && isCronExpression(source)) {
+        const initializedNextRun = calculateNextRun(config, currentTime);
+        await db.update(configs).set({
+          scheduleConfig: {
+            ...scheduleConfig,
+            nextRun: initializedNextRun,
+          },
+          updatedAt: currentTime,
+        }).where(eq(configs.id, config.id));
+
+        console.log(
+          `[Scheduler] Initialized next run for user ${config.userId}: ${initializedNextRun.toISOString()} ` +
+          `from cron "${source}" [timezone=${timezone}]`
+        );
+        continue;
+      }
+      
+      // Check if it's time to run based on nextRun
+      if (scheduleConfig.nextRun && new Date(scheduleConfig.nextRun) > currentTime) {
+        console.log(`[Scheduler] Skipping user ${config.userId} - next run at ${scheduleConfig.nextRun}`);
+        continue;
+      }
+      
+      // If no nextRun is set, or it's past due, run the sync
+      await runScheduledSync(config);
+    }
+  } catch (error) {
+    console.error('[Scheduler] Error in scheduler loop:', error);
+  } finally {
+    isSchedulerRunning = false;
+  }
+}
+
+/**
+ * Start the scheduler service
+ */
+export async function startSchedulerService(): Promise<void> {
+  if (schedulerInterval) {
+    console.log('[Scheduler] Scheduler service is already running');
+    return;
+  }
+  
+  console.log('[Scheduler] Starting scheduler service');
+  
+  // Check if we should auto-start mirroring based on environment variables
+  const shouldAutoStart = await checkAutoStartConfiguration();
+  
+  if (shouldAutoStart) {
+    console.log('[Scheduler] Auto-start detected from environment variables, triggering initial import and mirror...');
+    await performInitialAutoStart();
+  }
+  
+  // Run immediately on start
+  schedulerLoop().catch(error => {
+    console.error('[Scheduler] Error during initial scheduler run:', error);
+  });
+  
+  // Run every minute to check for scheduled tasks
+  const checkInterval = 60 * 1000; // 1 minute
+  schedulerInterval = setInterval(() => {
+    schedulerLoop().catch(error => {
+      console.error('[Scheduler] Error during scheduler run:', error);
+    });
+  }, checkInterval);
+  
+  console.log(`[Scheduler] Scheduler service started, checking every ${formatDuration(checkInterval)} for scheduled tasks`);
+  console.log('[Scheduler] To trigger manual sync, check your configuration intervals and ensure SCHEDULE_ENABLED=true or use GITEA_MIRROR_INTERVAL');
+}
+
+/**
+ * Stop the scheduler service
+ */
+export function stopSchedulerService(): void {
+  if (schedulerInterval) {
+    clearInterval(schedulerInterval);
+    schedulerInterval = null;
+    console.log('[Scheduler] Scheduler service stopped');
+  }
+}
+
+/**
+ * Check if the scheduler service is running
+ */
+export function isSchedulerServiceRunning(): boolean {
+  return schedulerInterval !== null;
+}

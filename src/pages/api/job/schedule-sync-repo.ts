@@ -1,0 +1,158 @@
+import type { APIRoute } from "astro";
+import { db, configs, repositories } from "@/lib/db";
+import { and, eq, or, sql } from "drizzle-orm";
+import { repoStatusEnum, repositoryVisibilityEnum } from "@/types/Repository";
+import { isRepoPresentInGitea } from "@/lib/gitea";
+import { syncRepositoryOnDestination } from "@/lib/mirror-dispatch";
+import { usesPushEngine } from "@/lib/destination-connection";
+import type {
+  ScheduleSyncRepoRequest,
+  ScheduleSyncRepoResponse,
+} from "@/types/sync";
+import { createSecureErrorResponse } from "@/lib/utils";
+import { getNextScheduledRun, normalizeTimezone } from "@/lib/utils/schedule-utils";
+import { requireAuthenticatedUserId } from "@/lib/auth-guards";
+
+export const POST: APIRoute = async ({ request, locals }) => {
+  try {
+    const authResult = await requireAuthenticatedUserId({ request, locals });
+    if ("response" in authResult) return authResult.response;
+    const userId = authResult.userId;
+
+    await request.json().catch(() => ({} as ScheduleSyncRepoRequest));
+
+    // Fetch config for the user — prefer active and most-recently-updated to avoid
+    // picking a stale inactive stub when multiple rows exist (see issue #271).
+    const configResult = await db
+      .select()
+      .from(configs)
+      .where(eq(configs.userId, userId))
+      .orderBy(sql`${configs.isActive} DESC`, sql`${configs.updatedAt} DESC`)
+      .limit(1);
+
+    const config = configResult[0];
+
+    // Scheduling a sync only needs the destination; see sync-repo.ts.
+    if (!config || !config.giteaConfig?.token) {
+      return new Response(
+        JSON.stringify({
+          success: false,
+          error: "Config missing for the user or destination token not found.",
+          repositories: [],
+        } satisfies ScheduleSyncRepoResponse),
+        { status: 400, headers: { "Content-Type": "application/json" } }
+      );
+    }
+
+    // Fetch repositories with status 'mirrored' or 'synced'
+    const repos = await db
+      .select()
+      .from(repositories)
+      .where(
+        and(
+          eq(repositories.userId, userId),
+          or(
+            eq(repositories.status, "mirrored"),
+            eq(repositories.status, "synced"),
+            eq(repositories.status, "failed")
+          )
+        )
+      );
+
+    if (!repos.length) {
+      return new Response(
+        JSON.stringify({
+          success: false,
+          error:
+            "No repositories found with status mirrored, synced or failed.",
+          repositories: [],
+        } satisfies ScheduleSyncRepoResponse),
+        { status: 404, headers: { "Content-Type": "application/json" } }
+      );
+    }
+
+    // Calculate nextRun and update lastRun and nextRun in the config
+    const currentTime = new Date();
+    const scheduleSource =
+      config.scheduleConfig?.interval ||
+      config.giteaConfig?.mirrorInterval ||
+      "3600";
+    const timezone = normalizeTimezone(config.scheduleConfig?.timezone || "UTC");
+    let nextRun = new Date(currentTime.getTime() + 3600 * 1000);
+    try {
+      nextRun = getNextScheduledRun(scheduleSource, currentTime, timezone);
+    } catch {
+      nextRun = new Date(currentTime.getTime() + 3600 * 1000);
+    }
+
+    // Update the full giteaConfig object
+    await db
+      .update(configs)
+      .set({
+        scheduleConfig: {
+          ...config.scheduleConfig,
+          lastRun: currentTime,
+          nextRun: nextRun,
+        },
+      })
+      .where(eq(configs.userId, userId));
+
+    // Start async sync in background
+    setTimeout(async () => {
+      for (const repo of repos) {
+        try {
+          // Only check Gitea presence if the repo failed previously
+          if (repo.status === "failed" && !usesPushEngine(config)) {
+            const isPresent = await isRepoPresentInGitea({
+              config,
+              owner: repo.owner,
+              repoName: repo.name,
+            });
+
+            if (!isPresent) {
+              continue; //silently skip if repo is not present in Gitea
+            }
+          }
+
+          await syncRepositoryOnDestination({
+            config,
+            repository: {
+              ...repo,
+              status: repoStatusEnum.parse(repo.status),
+              organization: repo.organization ?? undefined,
+              lastMirrored: repo.lastMirrored ?? undefined,
+              errorMessage: repo.errorMessage ?? undefined,
+              mirroredLocation: repo.mirroredLocation || "",
+              forkedFrom: repo.forkedFrom ?? undefined,
+              visibility: repositoryVisibilityEnum.parse(repo.visibility),
+            },
+          });
+        } catch (error) {
+          console.error(`Sync failed for repo ${repo.name}:`, error);
+        }
+      }
+    }, 0);
+
+    const resPayload: ScheduleSyncRepoResponse = {
+      success: true,
+      message: "Sync job scheduled for eligible repositories.",
+      repositories: repos.map((repo) => ({
+        ...repo,
+        status: repoStatusEnum.parse(repo.status),
+        organization: repo.organization ?? undefined,
+        lastMirrored: repo.lastMirrored ?? undefined,
+        errorMessage: repo.errorMessage ?? undefined,
+        forkedFrom: repo.forkedFrom ?? undefined,
+        visibility: repositoryVisibilityEnum.parse(repo.visibility),
+        mirroredLocation: repo.mirroredLocation || "",
+      })),
+    };
+
+    return new Response(JSON.stringify(resPayload), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
+  } catch (error) {
+    return createSecureErrorResponse(error, "schedule sync", 500);
+  }
+};

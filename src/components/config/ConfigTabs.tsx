@@ -1,0 +1,900 @@
+import { useEffect, useState, useCallback, useRef } from 'react';
+import { GitHubConfigForm } from './GitHubConfigForm';
+import { GiteaConfigForm } from './GiteaConfigForm';
+import { SourcesCard } from './SourcesCard';
+import { GitHubMirrorSettings } from './GitHubMirrorSettings';
+import { AutomationSettings } from './AutomationSettings';
+import { SSOSettings } from './SSOSettings';
+import { ApiKeysSettings } from './ApiKeysSettings';
+import { NotificationSettings } from './NotificationSettings';
+import type {
+  ConfigApiResponse,
+  GiteaConfig,
+  GitHubConfig,
+  SaveConfigApiRequest,
+  SaveConfigApiResponse,
+  ScheduleConfig,
+  DatabaseCleanupConfig,
+  MirrorOptions,
+  AdvancedOptions,
+  NotificationConfig,
+  ConfigLockState,
+  SourceApiRecord,
+} from '@/types/config';
+import { Button } from '../ui/button';
+import { useAuth } from '@/hooks/useAuth';
+import { apiRequest, showErrorToast } from '@/lib/utils';
+import { RefreshCw } from 'lucide-react';
+import { toast } from 'sonner';
+import { Skeleton } from '@/components/ui/skeleton';
+import { invalidateConfigCache } from '@/hooks/useConfigStatus';
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
+import { withBase } from '@/lib/base-path';
+import { SOURCE_PROVIDER_LABELS } from '@/lib/source-providers/kinds';
+
+type ConfigState = {
+  githubConfig: GitHubConfig;
+  giteaConfig: GiteaConfig;
+  scheduleConfig: ScheduleConfig;
+  cleanupConfig: DatabaseCleanupConfig;
+  mirrorOptions: MirrorOptions;
+  advancedOptions: AdvancedOptions;
+  notificationConfig: NotificationConfig;
+};
+
+const CONFIG_API_PATH = withBase('/api/config');
+
+export function ConfigTabs() {
+  const [config, setConfig] = useState<ConfigState>({
+    githubConfig: {
+      provider: 'github',
+      url: '',
+      username: '',
+      token: '',
+      privateRepositories: false,
+      mirrorStarred: false,
+      starredLists: [],
+    },
+    giteaConfig: {
+      provider: 'gitea',
+      url: '',
+      externalUrl: '',
+      username: '',
+      token: '',
+      organization: 'github-mirrors',
+      visibility: 'public',
+      starredReposOrg: 'starred',
+      starredReposMode: 'dedicated-org',
+      preserveOrgStructure: false,
+      backupStrategy: "on-force-push",
+      backupRetentionCount: 5,
+      backupRetentionDays: 30,
+      backupDirectory: 'data/repo-backups',
+      blockSyncOnBackupFailure: true,
+    },
+    scheduleConfig: {
+      enabled: false, // Don't set defaults here - will be loaded from API
+      interval: 0, // Will be replaced with actual value from API
+    },
+    cleanupConfig: {
+      enabled: false, // Don't set defaults here - will be loaded from API  
+      retentionDays: 0, // Will be replaced with actual value from API
+      deleteIfNotInGitHub: true,
+      orphanedRepoAction: "archive",
+      dryRun: false,
+      deleteFromGitea: false,
+      protectedRepos: [],
+    },
+    mirrorOptions: {
+      mirrorReleases: false,
+      mirrorLFS: false,
+      mirrorMetadata: false,
+      metadataComponents: {
+        issues: false,
+        pullRequests: false,
+        labels: false,
+        milestones: false,
+        wiki: false,
+      },
+      issueState: "all",
+      issueComments: true,
+      issueMedia: true,
+    },
+    advancedOptions: {
+      skipForks: false,
+      starredCodeOnly: false,
+      autoMirrorStarred: false,
+    },
+    notificationConfig: {
+      enabled: false,
+      provider: "ntfy",
+      notifyOnSyncError: true,
+      notifyOnSyncSuccess: false,
+      notifyOnNewRepo: false,
+      notifyOnNewOwnRepo: true,
+      notifyOnNewOrgRepo: true,
+      notifyOnNewStarredRepo: true,
+    },
+  });
+  const { user } = useAuth();
+  const [isLoading, setIsLoading] = useState(true);
+  const [isSyncing, setIsSyncing] = useState<boolean>(false);
+  // Source and destination locks from the API; null until the config is loaded.
+  const [locks, setLocks] = useState<ConfigLockState | null>(null);
+  // Connected sources; the source of truth for the source side of the page.
+  const [sources, setSources] = useState<SourceApiRecord[]>([]);
+
+  const [isAutoSavingSchedule, setIsAutoSavingSchedule] = useState<boolean>(false);
+  const [isAutoSavingCleanup, setIsAutoSavingCleanup] = useState<boolean>(false);
+  const [isAutoSavingGitHub, setIsAutoSavingGitHub] = useState<boolean>(false);
+  const [isAutoSavingGitea, setIsAutoSavingGitea] = useState<boolean>(false);
+  const [isAutoSavingNotification, setIsAutoSavingNotification] = useState<boolean>(false);
+  const autoSaveScheduleTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const autoSaveCleanupTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const autoSaveGitHubTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const autoSaveGiteaTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const autoSaveNotificationTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+
+  // Sources are the source of truth for the source connection; the legacy
+  // githubConfig check only covers APIs that predate multi-source support.
+  const isSourceConnected = (): boolean => {
+    if (sources.length > 0) {
+      return sources.some((source) => {
+        if (!source.enabled) return false;
+        if (source.authType === 'app') {
+          return Boolean(source.appId?.trim() && source.installationId?.trim());
+        }
+        return Boolean(source.token && source.token.trim());
+      });
+    }
+    const { githubConfig } = config;
+    return !!(githubConfig.username.trim() && githubConfig.token.trim());
+  };
+
+  const isConfigFormValid = (): boolean => {
+    const { giteaConfig } = config;
+    const isGiteaValid = !!(
+      giteaConfig.url.trim() &&
+      giteaConfig.username.trim() &&
+      giteaConfig.token.trim()
+    );
+    return isSourceConnected() && isGiteaValid;
+  };
+
+  const isGitHubConfigValid = (): boolean => {
+    return isSourceConnected();
+  };
+
+  // Removed the problematic useEffect that was causing circular dependencies
+  // The lastRun and nextRun should be managed by the backend and fetched via API
+
+  const sourceLabel = SOURCE_PROVIDER_LABELS[config.githubConfig.provider ?? 'github'];
+
+  const handleImportGitHubData = async () => {
+    if (!user?.id) return;
+    setIsSyncing(true);
+    try {
+      const result = await apiRequest<{ success: boolean; message?: string; failedOrgs?: string[]; recoveredOrgs?: number }>(
+        `/sync?userId=${user.id}`,
+        { method: 'POST' },
+      );
+      if (result.success) {
+        toast.success(
+          `${sourceLabel} data imported successfully! Head to the Repositories page to start mirroring.`,
+        );
+        if (result.failedOrgs && result.failedOrgs.length > 0) {
+          toast.warning(
+            `${result.failedOrgs.length} org${result.failedOrgs.length > 1 ? 's' : ''} failed to import (${result.failedOrgs.join(', ')}). Check the Organizations tab for details.`,
+          );
+        }
+        if (result.recoveredOrgs && result.recoveredOrgs > 0) {
+          toast.success(
+            `${result.recoveredOrgs} previously failed org${result.recoveredOrgs > 1 ? 's' : ''} recovered successfully.`,
+          );
+        }
+      } else {
+        toast.error(
+          `Failed to import ${sourceLabel} data: ${
+            result.message || 'Unknown error'
+          }`,
+        );
+      }
+    } catch (error) {
+      toast.error(
+        `Error importing ${sourceLabel} data: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    } finally {
+      setIsSyncing(false);
+    }
+  };
+
+  // Auto-save function specifically for schedule config changes
+  const autoSaveScheduleConfig = useCallback(async (scheduleConfig: ScheduleConfig) => {
+    if (!user?.id) return;
+
+    // Clear any existing timeout
+    if (autoSaveScheduleTimeoutRef.current) {
+      clearTimeout(autoSaveScheduleTimeoutRef.current);
+    }
+
+    // Debounce the auto-save to prevent excessive API calls
+    autoSaveScheduleTimeoutRef.current = setTimeout(async () => {
+      setIsAutoSavingSchedule(true);
+
+      const reqPayload: SaveConfigApiRequest = {
+        userId: user.id!,
+        githubConfig: config.githubConfig,
+        giteaConfig: config.giteaConfig,
+        scheduleConfig: scheduleConfig,
+        cleanupConfig: config.cleanupConfig,
+        mirrorOptions: config.mirrorOptions,
+        advancedOptions: config.advancedOptions,
+      };
+
+      try {
+        const response = await fetch(CONFIG_API_PATH, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(reqPayload),
+        });
+        const result: SaveConfigApiResponse = await response.json();
+
+        if (result.success) {
+          // Silent success - no toast for auto-save
+          // Removed refreshUser() call to prevent page reload
+          // Invalidate config cache so other components get fresh data
+          invalidateConfigCache();
+
+          // Fetch updated config to get the recalculated nextRun time
+          try {
+            const updatedResponse = await apiRequest<ConfigApiResponse>(
+              `/config?userId=${user.id}`,
+              { method: 'GET' },
+            );
+            if (updatedResponse && !updatedResponse.error) {
+              setConfig(prev => ({
+                ...prev,
+                scheduleConfig: updatedResponse.scheduleConfig || prev.scheduleConfig,
+              }));
+            }
+          } catch (fetchError) {
+            console.warn('Failed to fetch updated config after auto-save:', fetchError);
+          }
+        } else {
+          showErrorToast(
+            `Auto-save failed: ${result.message || 'Unknown error'}`,
+            toast
+          );
+        }
+      } catch (error) {
+        showErrorToast(error, toast);
+      } finally {
+        setIsAutoSavingSchedule(false);
+      }
+    }, 500); // 500ms debounce
+  }, [user?.id, config.githubConfig, config.giteaConfig, config.cleanupConfig]);
+
+  // Auto-save function specifically for cleanup config changes
+  const autoSaveCleanupConfig = useCallback(async (cleanupConfig: DatabaseCleanupConfig) => {
+    if (!user?.id) return;
+
+    // Clear any existing timeout
+    if (autoSaveCleanupTimeoutRef.current) {
+      clearTimeout(autoSaveCleanupTimeoutRef.current);
+    }
+
+    // Debounce the auto-save to prevent excessive API calls
+    autoSaveCleanupTimeoutRef.current = setTimeout(async () => {
+      setIsAutoSavingCleanup(true);
+
+      const reqPayload: SaveConfigApiRequest = {
+        userId: user.id!,
+        githubConfig: config.githubConfig,
+        giteaConfig: config.giteaConfig,
+        scheduleConfig: config.scheduleConfig,
+        cleanupConfig: cleanupConfig,
+        mirrorOptions: config.mirrorOptions,
+        advancedOptions: config.advancedOptions,
+      };
+
+      try {
+        const response = await fetch(CONFIG_API_PATH, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(reqPayload),
+        });
+        const result: SaveConfigApiResponse = await response.json();
+
+        if (result.success) {
+          // Silent success - no toast for auto-save
+          // Invalidate config cache so other components get fresh data
+          invalidateConfigCache();
+
+          // Fetch updated config to get the recalculated nextRun time
+          try {
+            const updatedResponse = await apiRequest<ConfigApiResponse>(
+              `/config?userId=${user.id}`,
+              { method: 'GET' },
+            );
+            if (updatedResponse && !updatedResponse.error) {
+              setConfig(prev => ({
+                ...prev,
+                cleanupConfig: updatedResponse.cleanupConfig || prev.cleanupConfig,
+              }));
+            }
+          } catch (fetchError) {
+            console.warn('Failed to fetch updated config after auto-save:', fetchError);
+          }
+        } else {
+          showErrorToast(
+            `Auto-save failed: ${result.message || 'Unknown error'}`,
+            toast
+          );
+        }
+      } catch (error) {
+        showErrorToast(error, toast);
+      } finally {
+        setIsAutoSavingCleanup(false);
+      }
+    }, 500); // 500ms debounce
+  }, [user?.id, config.githubConfig, config.giteaConfig, config.scheduleConfig]);
+
+  // Auto-save function specifically for GitHub config changes
+  const autoSaveGitHubConfig = useCallback(async (
+    githubConfig: GitHubConfig,
+    options: { confirmSourceChange?: boolean } = {},
+  ) => {
+    if (!user?.id) return;
+
+    // Clear any existing timeout
+    if (autoSaveGitHubTimeoutRef.current) {
+      clearTimeout(autoSaveGitHubTimeoutRef.current);
+    }
+
+    // Debounce the auto-save to prevent excessive API calls
+    autoSaveGitHubTimeoutRef.current = setTimeout(async () => {
+      setIsAutoSavingGitHub(true);
+
+      const reqPayload: SaveConfigApiRequest = {
+        userId: user.id!,
+        githubConfig: githubConfig,
+        giteaConfig: config.giteaConfig,
+        scheduleConfig: config.scheduleConfig,
+        cleanupConfig: config.cleanupConfig,
+        mirrorOptions: config.mirrorOptions,
+        advancedOptions: config.advancedOptions,
+        ...(options.confirmSourceChange ? { confirmSourceChange: true } : {}),
+      };
+
+      try {
+        const response = await fetch(CONFIG_API_PATH, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(reqPayload),
+        });
+        const result: SaveConfigApiResponse = await response.json();
+
+        if (result.success) {
+          // Silent success - no toast for auto-save
+          // Invalidate config cache so other components get fresh data
+          invalidateConfigCache();
+        } else {
+          showErrorToast(
+            `Auto-save failed: ${result.message || 'Unknown error'}`,
+            toast
+          );
+        }
+      } catch (error) {
+        showErrorToast(error, toast);
+      } finally {
+        setIsAutoSavingGitHub(false);
+      }
+    }, 500); // 500ms debounce
+  }, [user?.id, config.giteaConfig, config.scheduleConfig, config.cleanupConfig]);
+
+  // Auto-save function specifically for Gitea config changes
+  const autoSaveGiteaConfig = useCallback(async (
+    giteaConfig: GiteaConfig,
+    options: { confirmDestinationChange?: boolean } = {},
+  ) => {
+    if (!user?.id) return;
+
+    // Clear any existing timeout
+    if (autoSaveGiteaTimeoutRef.current) {
+      clearTimeout(autoSaveGiteaTimeoutRef.current);
+    }
+
+    // Debounce the auto-save to prevent excessive API calls
+    autoSaveGiteaTimeoutRef.current = setTimeout(async () => {
+      setIsAutoSavingGitea(true);
+
+      const reqPayload: SaveConfigApiRequest = {
+        userId: user.id!,
+        githubConfig: config.githubConfig,
+        giteaConfig: giteaConfig,
+        scheduleConfig: config.scheduleConfig,
+        cleanupConfig: config.cleanupConfig,
+        mirrorOptions: config.mirrorOptions,
+        advancedOptions: config.advancedOptions,
+        ...(options.confirmDestinationChange ? { confirmDestinationChange: true } : {}),
+      };
+
+      try {
+        const response = await fetch(CONFIG_API_PATH, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(reqPayload),
+        });
+        const result: SaveConfigApiResponse = await response.json();
+
+        if (result.success) {
+          // Silent success - no toast for auto-save
+          // Invalidate config cache so other components get fresh data
+          invalidateConfigCache();
+        } else {
+          showErrorToast(
+            `Auto-save failed: ${result.message || 'Unknown error'}`,
+            toast
+          );
+        }
+      } catch (error) {
+        showErrorToast(error, toast);
+      } finally {
+        setIsAutoSavingGitea(false);
+      }
+    }, 500); // 500ms debounce
+  }, [user?.id, config.githubConfig, config.scheduleConfig, config.cleanupConfig]);
+
+  // Auto-save function for mirror options (handled within GitHub config)
+  const autoSaveMirrorOptions = useCallback(async (mirrorOptions: MirrorOptions) => {
+    if (!user?.id) return;
+
+    const reqPayload: SaveConfigApiRequest = {
+      userId: user.id!,
+      githubConfig: config.githubConfig,
+      giteaConfig: config.giteaConfig,
+      scheduleConfig: config.scheduleConfig,
+      cleanupConfig: config.cleanupConfig,
+      mirrorOptions: mirrorOptions,
+      advancedOptions: config.advancedOptions,
+    };
+
+    try {
+      const response = await fetch(CONFIG_API_PATH, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(reqPayload),
+      });
+      const result: SaveConfigApiResponse = await response.json();
+
+      if (result.success) {
+        invalidateConfigCache();
+      } else {
+        showErrorToast(
+          `Auto-save failed: ${result.message || 'Unknown error'}`,
+          toast
+        );
+      }
+    } catch (error) {
+      showErrorToast(error, toast);
+    }
+  }, [user?.id, config.githubConfig, config.giteaConfig, config.scheduleConfig, config.cleanupConfig, config.advancedOptions]);
+
+  // Auto-save function for advanced options (handled within GitHub config)
+  const autoSaveAdvancedOptions = useCallback(async (advancedOptions: AdvancedOptions) => {
+    if (!user?.id) return;
+
+    const reqPayload: SaveConfigApiRequest = {
+      userId: user.id!,
+      githubConfig: config.githubConfig,
+      giteaConfig: config.giteaConfig,
+      scheduleConfig: config.scheduleConfig,
+      cleanupConfig: config.cleanupConfig,
+      mirrorOptions: config.mirrorOptions,
+      advancedOptions: advancedOptions,
+    };
+
+    try {
+      const response = await fetch(CONFIG_API_PATH, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(reqPayload),
+      });
+      const result: SaveConfigApiResponse = await response.json();
+
+      if (result.success) {
+        invalidateConfigCache();
+      } else {
+        showErrorToast(
+          `Auto-save failed: ${result.message || 'Unknown error'}`,
+          toast
+        );
+      }
+    } catch (error) {
+      showErrorToast(error, toast);
+    }
+  }, [user?.id, config.githubConfig, config.giteaConfig, config.scheduleConfig, config.cleanupConfig, config.mirrorOptions]);
+
+  // Auto-save function for notification config changes
+  const autoSaveNotificationConfig = useCallback(async (notifConfig: NotificationConfig) => {
+    if (!user?.id) return;
+
+    // Clear any existing timeout
+    if (autoSaveNotificationTimeoutRef.current) {
+      clearTimeout(autoSaveNotificationTimeoutRef.current);
+    }
+
+    // Debounce the auto-save to prevent excessive API calls
+    autoSaveNotificationTimeoutRef.current = setTimeout(async () => {
+      setIsAutoSavingNotification(true);
+
+      const reqPayload = {
+        userId: user.id!,
+        githubConfig: config.githubConfig,
+        giteaConfig: config.giteaConfig,
+        scheduleConfig: config.scheduleConfig,
+        cleanupConfig: config.cleanupConfig,
+        mirrorOptions: config.mirrorOptions,
+        advancedOptions: config.advancedOptions,
+        notificationConfig: notifConfig,
+      };
+
+      try {
+        const response = await fetch(CONFIG_API_PATH, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(reqPayload),
+        });
+        const result: SaveConfigApiResponse = await response.json();
+
+        if (result.success) {
+          // Silent success - no toast for auto-save
+          invalidateConfigCache();
+        } else {
+          showErrorToast(
+            `Auto-save failed: ${result.message || 'Unknown error'}`,
+            toast
+          );
+        }
+      } catch (error) {
+        showErrorToast(error, toast);
+      } finally {
+        setIsAutoSavingNotification(false);
+      }
+    }, 500); // 500ms debounce
+  }, [user?.id, config.githubConfig, config.giteaConfig, config.scheduleConfig, config.cleanupConfig, config.mirrorOptions, config.advancedOptions]);
+
+  // Cleanup timeouts on unmount
+  useEffect(() => {
+    return () => {
+      if (autoSaveScheduleTimeoutRef.current) {
+        clearTimeout(autoSaveScheduleTimeoutRef.current);
+      }
+      if (autoSaveCleanupTimeoutRef.current) {
+        clearTimeout(autoSaveCleanupTimeoutRef.current);
+      }
+      if (autoSaveGitHubTimeoutRef.current) {
+        clearTimeout(autoSaveGitHubTimeoutRef.current);
+      }
+      if (autoSaveGiteaTimeoutRef.current) {
+        clearTimeout(autoSaveGiteaTimeoutRef.current);
+      }
+      if (autoSaveNotificationTimeoutRef.current) {
+        clearTimeout(autoSaveNotificationTimeoutRef.current);
+      }
+    };
+  }, []);
+
+  // Loads (or reloads) the config: fills the forms, locks and the sources
+  // list. SourcesCard calls this after every source mutation; only the
+  // initial load shows the page skeleton.
+  const loadConfig = useCallback(async () => {
+    if (!user?.id) return;
+
+    try {
+      const response = await apiRequest<ConfigApiResponse>(
+        `/config?userId=${user.id}`,
+        { method: 'GET' },
+      );
+      if (response && !response.error) {
+        setLocks(response.locks ?? null);
+        setSources(response.sources ?? []);
+        setConfig(prev => ({
+          githubConfig: {
+            ...prev.githubConfig,
+            ...response.githubConfig, // Merge so a response without provider keeps the default
+          },
+          giteaConfig:
+            response.giteaConfig || prev.giteaConfig,
+          scheduleConfig:
+            response.scheduleConfig || prev.scheduleConfig,
+          cleanupConfig: {
+            ...prev.cleanupConfig,
+            ...response.cleanupConfig, // Merge to preserve all fields
+          },
+          mirrorOptions: {
+            ...prev.mirrorOptions,
+            ...response.mirrorOptions, // Merge to preserve all fields including new mirrorLFS
+          },
+          advancedOptions:
+            response.advancedOptions || prev.advancedOptions,
+          notificationConfig: {
+            ...prev.notificationConfig,
+            ...((response as any).notificationConfig ?? {}), // Merge so a row saved before a switch existed keeps its default
+          },
+        }));
+
+      }
+    } catch (error) {
+      console.warn(
+        'Could not fetch configuration, using defaults:',
+        error,
+      );
+    }
+  }, [user?.id]);
+
+  useEffect(() => {
+    if (!user?.id) return;
+
+    setIsLoading(true);
+    loadConfig().finally(() => setIsLoading(false));
+  }, [loadConfig]); // Only depend on user.id, not the entire user object
+
+  function ConfigCardSkeleton() {
+    return (
+      <div className="space-y-6">
+        {/* Header section */}
+        <div className="flex flex-row justify-between items-start">
+          <div className="flex flex-col gap-y-1.5">
+            <Skeleton className="h-8 w-48" />
+            <Skeleton className="h-4 w-72" />
+          </div>
+          <div className="flex gap-x-4">
+            <Skeleton className="h-10 w-36" />
+          </div>
+        </div>
+
+        {/* Content section - Grid layout */}
+        <div className="space-y-4">
+          {/* GitHub & Gitea connections - Side by side */}
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <div className="border rounded-lg p-4">
+              <div className="flex justify-between items-center mb-4">
+                <Skeleton className="h-6 w-40" />
+                <Skeleton className="h-9 w-32" />
+              </div>
+              <div className="space-y-4">
+                <Skeleton className="h-20 w-full" />
+                <Skeleton className="h-20 w-full" />
+                <Skeleton className="h-1 w-full" />
+                <Skeleton className="h-32 w-full" />
+                <Skeleton className="h-48 w-full" />
+                <Skeleton className="h-32 w-full" />
+              </div>
+            </div>
+            <div className="border rounded-lg p-4">
+              <div className="flex justify-between items-center mb-4">
+                <Skeleton className="h-6 w-40" />
+                <Skeleton className="h-9 w-32" />
+              </div>
+              <div className="space-y-4">
+                <Skeleton className="h-20 w-full" />
+                <Skeleton className="h-20 w-full" />
+                <Skeleton className="h-20 w-full" />
+                <Skeleton className="h-64 w-full" />
+              </div>
+            </div>
+          </div>
+
+          {/* Automation & Maintenance - Full width */}
+          <div className="border rounded-lg p-4">
+            <Skeleton className="h-8 w-48 mb-4" />
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+              <div className="space-y-4">
+                <Skeleton className="h-6 w-40" />
+                <Skeleton className="h-16 w-full" />
+                <Skeleton className="h-24 w-full" />
+              </div>
+              <div className="space-y-4">
+                <Skeleton className="h-6 w-40" />
+                <Skeleton className="h-16 w-full" />
+                <Skeleton className="h-24 w-full" />
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  return isLoading ? (
+    <div className="space-y-6">
+      <ConfigCardSkeleton />
+    </div>
+  ) : (
+    <div className="space-y-6">
+      {/* Header section */}
+      <div className="flex flex-col md:flex-row justify-between gap-y-4 items-start">
+        <div className="flex flex-col gap-y-1.5">
+          <h1 className="text-2xl font-semibold leading-none tracking-tight">
+            Configuration
+          </h1>
+          <p className="text-sm text-muted-foreground">
+            Connect your sources and destination, and set up automatic
+            mirroring.
+          </p>
+        </div>
+        <div className="flex gap-x-4 w-full md:w-auto">
+          <Button
+            onClick={handleImportGitHubData}
+            disabled={isSyncing || !isGitHubConfigValid()}
+            title={
+              !isGitHubConfigValid()
+                ? 'Connect a source with a token first'
+                : isSyncing
+                ? 'Import in progress'
+                : `Import ${sourceLabel} Data`
+            }
+            className="w-full bg-indigo-500 text-white hover:bg-indigo-600 disabled:bg-muted disabled:text-muted-foreground md:w-auto"
+          >
+            {isSyncing ? (
+              <>
+                <RefreshCw className="h-4 w-4 animate-spin mr-1" />
+                Import {sourceLabel} Data
+              </>
+            ) : (
+              <>
+                <RefreshCw className="h-4 w-4 mr-1" />
+                Import {sourceLabel} Data
+              </>
+            )}
+          </Button>
+        </div>
+      </div>
+
+      {/* Content section - Tabs layout */}
+      <Tabs defaultValue="connections" className="space-y-4">
+        <TabsList className="grid h-auto w-full grid-cols-2 gap-1 sm:grid-cols-4">
+          <TabsTrigger value="connections">Connections</TabsTrigger>
+          <TabsTrigger value="automation">Automation</TabsTrigger>
+          <TabsTrigger value="notifications">Notifications</TabsTrigger>
+          <TabsTrigger value="sso">Authentication</TabsTrigger>
+        </TabsList>
+
+        <TabsContent value="connections" className="space-y-6">
+          {(() => {
+            const githubFormProps = {
+              config: config.githubConfig,
+              setConfig: (update: React.SetStateAction<typeof config.githubConfig>) =>
+                setConfig(prev => ({
+                  ...prev,
+                  githubConfig:
+                    typeof update === 'function'
+                      ? update(prev.githubConfig)
+                      : update,
+                })),
+              mirrorOptions: config.mirrorOptions,
+              setMirrorOptions: (update: React.SetStateAction<typeof config.mirrorOptions>) =>
+                setConfig(prev => ({
+                  ...prev,
+                  mirrorOptions:
+                    typeof update === 'function'
+                      ? update(prev.mirrorOptions)
+                      : update,
+                })),
+              advancedOptions: config.advancedOptions,
+              setAdvancedOptions: (update: React.SetStateAction<typeof config.advancedOptions>) =>
+                setConfig(prev => ({
+                  ...prev,
+                  advancedOptions:
+                    typeof update === 'function'
+                      ? update(prev.advancedOptions)
+                      : update,
+                })),
+              giteaConfig: config.giteaConfig,
+              setGiteaConfig: (update: React.SetStateAction<typeof config.giteaConfig>) =>
+                setConfig(prev => ({
+                  ...prev,
+                  giteaConfig:
+                    typeof update === 'function'
+                      ? update(prev.giteaConfig)
+                      : update,
+                })),
+              onAutoSave: autoSaveGitHubConfig,
+              onMirrorOptionsAutoSave: autoSaveMirrorOptions,
+              onAdvancedOptionsAutoSave: autoSaveAdvancedOptions,
+              onGiteaAutoSave: autoSaveGiteaConfig,
+              isAutoSaving: isAutoSavingGitHub,
+              sourceLock: locks?.source,
+            };
+            const giteaFormProps = {
+              config: config.giteaConfig,
+              setConfig: (update: React.SetStateAction<typeof config.giteaConfig>) =>
+                setConfig(prev => ({
+                  ...prev,
+                  giteaConfig:
+                    typeof update === 'function'
+                      ? update(prev.giteaConfig)
+                      : update,
+                })),
+              onAutoSave: autoSaveGiteaConfig,
+              isAutoSaving: isAutoSavingGitea,
+              githubUsername: config.githubConfig.username,
+              destinationLock: locks?.destination,
+            };
+            return (
+              <>
+                {/* Connection cards share a stretched row so they stay equal height */}
+                <div className="grid grid-cols-1 gap-6 md:grid-cols-2">
+                  <SourcesCard sources={sources} onRefresh={loadConfig} />
+                  <GiteaConfigForm {...giteaFormProps} part="connection" />
+                </div>
+                <div className="grid grid-cols-1 gap-6 md:grid-cols-2 md:items-start">
+                  <GitHubConfigForm {...githubFormProps} part="settings" />
+                  <div className="flex flex-col gap-6">
+                    <GiteaConfigForm {...giteaFormProps} part="organization" />
+                    <GitHubMirrorSettings
+                      part="content"
+                      githubConfig={config.githubConfig}
+                      sources={sources}
+                      destinationProvider={config.giteaConfig.provider}
+                      mirrorOptions={config.mirrorOptions}
+                      advancedOptions={config.advancedOptions}
+                      onGitHubConfigChange={newConfig => {
+                        setConfig(prev => ({ ...prev, githubConfig: newConfig }));
+                        autoSaveGitHubConfig(newConfig);
+                      }}
+                      onMirrorOptionsChange={newOptions => {
+                        setConfig(prev => ({ ...prev, mirrorOptions: newOptions }));
+                        autoSaveMirrorOptions(newOptions);
+                      }}
+                      onAdvancedOptionsChange={newOptions => {
+                        setConfig(prev => ({ ...prev, advancedOptions: newOptions }));
+                        autoSaveAdvancedOptions(newOptions);
+                      }}
+                    />
+                  </div>
+                </div>
+              </>
+            );
+          })()}
+        </TabsContent>
+
+        <TabsContent value="automation" className="space-y-4">
+          <AutomationSettings
+            scheduleConfig={config.scheduleConfig}
+            cleanupConfig={config.cleanupConfig}
+            onScheduleChange={(newConfig) => {
+              setConfig(prev => ({ ...prev, scheduleConfig: newConfig }));
+              autoSaveScheduleConfig(newConfig);
+            }}
+            onCleanupChange={(newConfig) => {
+              setConfig(prev => ({ ...prev, cleanupConfig: newConfig }));
+              autoSaveCleanupConfig(newConfig);
+            }}
+            isAutoSavingSchedule={isAutoSavingSchedule}
+            isAutoSavingCleanup={isAutoSavingCleanup}
+          />
+        </TabsContent>
+
+        <TabsContent value="notifications" className="space-y-4">
+          <NotificationSettings
+            notificationConfig={config.notificationConfig}
+            onNotificationChange={(newConfig) => {
+              setConfig(prev => ({ ...prev, notificationConfig: newConfig }));
+              autoSaveNotificationConfig(newConfig);
+            }}
+            isAutoSaving={isAutoSavingNotification}
+          />
+        </TabsContent>
+
+        <TabsContent value="sso" className="space-y-4">
+          <SSOSettings />
+          <ApiKeysSettings />
+        </TabsContent>
+      </Tabs>
+    </div>
+  );
+}

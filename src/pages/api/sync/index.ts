@@ -1,0 +1,365 @@
+import type { APIRoute } from "astro";
+import { db, organizations, repositories, configs } from "@/lib/db";
+import { eq, and, sql } from "drizzle-orm";
+import { v4 as uuidv4 } from "uuid";
+import { createMirrorJob } from "@/lib/helpers";
+import { SOURCE_PROVIDER_LABELS } from "@/lib/source-providers";
+import { jsonResponse, createSecureErrorResponse } from "@/lib/utils";
+import {
+  mergeGitReposPreferStarred,
+  normalizeGitRepoToInsert,
+  calcBatchSizeForInsert,
+  repositoryIdentityKeys,
+  selectNewRepositoriesByIdentity,
+} from "@/lib/repo-utils";
+import { loadOrganizationForkPolicies } from "@/lib/utils/mirror-overrides";
+import { requireAuthenticatedUserId } from "@/lib/auth-guards";
+import { isMirrorableGitHubRepo } from "@/lib/repo-eligibility";
+
+export const POST: APIRoute = async ({ request, locals }) => {
+  const authResult = await requireAuthenticatedUserId({ request, locals });
+  if ("response" in authResult) return authResult.response;
+  const userId = authResult.userId;
+
+  try {
+    // Prefer active and most-recently-updated config to avoid picking a stale
+    // inactive stub when multiple rows exist (see issue #271).
+    const [config] = await db
+      .select()
+      .from(configs)
+      .where(eq(configs.userId, userId))
+      .orderBy(sql`${configs.isActive} DESC`, sql`${configs.updatedAt} DESC`)
+      .limit(1);
+
+    if (!config) {
+      return jsonResponse({
+        data: { error: "No configuration found for this user" },
+        status: 404,
+      });
+    }
+
+    // Every enabled source the user connected, oldest first (the first entry
+    // is the primary source). A source without a token still lists public
+    // repositories through its provider. Configs written outside the sources
+    // API get their first source row seeded here.
+    const { listSources, ensureSourcesFromConfig, selectSameRunPinsToClear, decryptSourceToken } = await import("@/lib/sources");
+    const { createSourceProviderFromSource } = await import("@/lib/source-providers");
+    await ensureSourcesFromConfig(userId);
+    const sources = (await listSources(userId)).filter((source) => source.enabled);
+
+    if (sources.length === 0) {
+      return jsonResponse({
+        data: { error: "No enabled source is configured for this user" },
+        status: 400,
+      });
+    }
+
+    // Load ignored orgs from the DB so we can skip them during import
+    const ignoredOrgRows = await db
+      .select({ normalizedName: organizations.normalizedName })
+      .from(organizations)
+      .where(and(eq(organizations.userId, userId), eq(organizations.status, "ignored")));
+    const ignoredOrgNames = new Set(ignoredOrgRows.map((o) => o.normalizedName));
+
+    // Per-organization fork pins, so an org opted out of forks is not
+    // re-imported by this bulk pass even when the global switch is off.
+    // Loaded once; the pins apply to every source.
+    const orgForkOverrides = await loadOrganizationForkPolicies({ userId });
+
+    let totalInsertedRepos = 0;
+    let totalInsertedOrgs = 0;
+    let totalRecoveredOrgs = 0;
+    let totalSkippedDisabled = 0;
+    const failedOrgNames: string[] = [];
+    const failedSourceNames: string[] = [];
+    const skippedPublicSourceNames: string[] = [];
+
+    // Organization pins this run set itself (inserted, or re-pinned on
+    // recovery), by normalized name. A later source listing the same name
+    // clears only these; pins that existed before the run are a stored
+    // choice and stay as they are. See selectSameRunPinsToClear.
+    const pinnedThisRun = new Map<string, string>();
+
+    for (const source of sources) {
+      try {
+        // A public-only (tokenless) source has no account to list from: the
+        // personal and starred listings 401 on every call, which would count
+        // the source as failed and, when it is the only one, answer 502. Its
+        // organizations are added through the add-organization route and
+        // re-listed by the scheduler, which skips these sources the same way.
+        if (decryptSourceToken(source.token) === "") {
+          console.log(`Skipping personal discovery for public-only source ${source.name} (${source.id})`);
+          skippedPublicSourceNames.push(source.name);
+          continue;
+        }
+
+        const sourceProvider = createSourceProviderFromSource(source, { userId });
+        const sourceLabel = SOURCE_PROVIDER_LABELS[sourceProvider.kind];
+
+        // Fetch source data in parallel
+        const [basicAndForkedRepos, starredRepos, orgResult] = await Promise.all([
+          sourceProvider.listRepositories(config, { orgForkOverrides }),
+          config.githubConfig?.includeStarred
+            ? sourceProvider.listStarredRepositories(config)
+            : Promise.resolve([]),
+          sourceProvider.listOrganizations(config, ignoredOrgNames),
+        ]);
+        const { organizations: gitOrgs, failedOrgs } = orgResult;
+
+        // Merge and de-duplicate by fullName, preferring starred variant when duplicated
+        const allGithubRepos = mergeGitReposPreferStarred(basicAndForkedRepos, starredRepos);
+        const mirrorableGithubRepos = allGithubRepos.filter(isMirrorableGitHubRepo);
+        totalSkippedDisabled += allGithubRepos.length - mirrorableGithubRepos.length;
+
+        // Prepare full list of repos and orgs. The normalizer stamps the source
+        // provider and URL on every row; sourceId ties the row to this source.
+        const newRepos = mirrorableGithubRepos.map((repo) =>
+          normalizeGitRepoToInsert(repo, { userId, configId: config.id, sourceId: source.id })
+        );
+
+        const newOrgs = gitOrgs.map((org) => ({
+          id: uuidv4(),
+          userId,
+          configId: config.id,
+          name: org.name,
+          normalizedName: org.name.toLowerCase(),
+          avatarUrl: org.avatarUrl,
+          membershipRole: org.membershipRole,
+          isIncluded: false,
+          sourceId: source.id,
+          status: org.status,
+          repositoryCount: org.repositoryCount,
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        }));
+
+        // Prepare failed org records for DB insertion
+        const failedOrgRecords = failedOrgs.map((org) => ({
+          id: uuidv4(),
+          userId,
+          configId: config.id,
+          name: org.name,
+          normalizedName: org.name.toLowerCase(),
+          avatarUrl: org.avatarUrl,
+          membershipRole: "member" as const,
+          isIncluded: false,
+          sourceId: source.id,
+          status: "failed" as const,
+          errorMessage: org.reason,
+          repositoryCount: 0,
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        }));
+
+        let insertedRepos: typeof newRepos = [];
+        let insertedOrgs: typeof newOrgs = [];
+        let insertedFailedOrgs: typeof failedOrgRecords = [];
+        let recoveredOrgCount = 0;
+        // Names whose pin this source set or cleared; applied to pinnedThisRun
+        // only after the transaction commits, so a rolled-back source leaves
+        // the run's pin bookkeeping untouched.
+        let pinnedOrgNames: string[] = [];
+        let clearedOrgNames: string[] = [];
+
+        // Transaction to insert only new items
+        await db.transaction(async (tx) => {
+          const [existingRepos, existingOrgs] = await Promise.all([
+            tx
+              .select({
+                normalizedFullName: repositories.normalizedFullName,
+                sourceProvider: repositories.sourceProvider,
+                sourceUrl: repositories.sourceUrl,
+              })
+              .from(repositories)
+              .where(eq(repositories.userId, userId)),
+            tx
+              .select({ normalizedName: organizations.normalizedName, status: organizations.status })
+              .from(organizations)
+              .where(eq(organizations.userId, userId)),
+          ]);
+
+          // A repository is identified by its host and full name, whichever
+          // source row lists it. The same name on two hosts is two
+          // repositories; the same repository seen by two sources on one host
+          // (a personal token and a public-only source) is one, and must not
+          // become two rows that mirror to the same destination.
+          const existingRepoKeys = repositoryIdentityKeys(existingRepos);
+          const existingOrgMap = new Map(existingOrgs.map((o) => [o.normalizedName, o.status]));
+
+          insertedRepos = selectNewRepositoriesByIdentity(
+            newRepos.filter(
+              (r) => !r.organization || !ignoredOrgNames.has(r.organization.toLowerCase())
+            ),
+            existingRepoKeys
+          ).fresh;
+          insertedOrgs = newOrgs.filter((o) => !existingOrgMap.has(o.normalizedName));
+
+          // Update previously failed orgs that now succeeded. The pin must
+          // follow the recovering source, or the org mirror keeps scoping
+          // to the source the failure was recorded under.
+          const recoveredOrgs = newOrgs.filter(
+            (o) => existingOrgMap.get(o.normalizedName) === "failed"
+          );
+          for (const org of recoveredOrgs) {
+            await tx
+              .update(organizations)
+              .set({
+                status: "imported",
+                errorMessage: null,
+                repositoryCount: org.repositoryCount,
+                avatarUrl: org.avatarUrl,
+                membershipRole: org.membershipRole,
+                sourceId: org.sourceId,
+                updatedAt: new Date(),
+              })
+              .where(
+                and(
+                  eq(organizations.userId, userId),
+                  eq(organizations.normalizedName, org.normalizedName),
+                )
+              );
+          }
+          recoveredOrgCount = recoveredOrgs.length;
+
+          // An organization that an earlier source in this run pinned and
+          // that this source lists as well spans several sources, so its pin
+          // is cleared, the same rule migration 0020 applies. Only pins this
+          // run created are touched: an org the user pinned on purpose keeps
+          // its pin even when another source lists the same name.
+          clearedOrgNames = selectSameRunPinsToClear(newOrgs, pinnedThisRun, source.id);
+          for (const normalizedName of clearedOrgNames) {
+            await tx
+              .update(organizations)
+              .set({ sourceId: null, updatedAt: new Date() })
+              .where(
+                and(
+                  eq(organizations.userId, userId),
+                  eq(organizations.normalizedName, normalizedName),
+                )
+              );
+          }
+
+          // Insert or update failed orgs (only update orgs already in "failed" state — don't overwrite good state)
+          insertedFailedOrgs = failedOrgRecords.filter((o) => !existingOrgMap.has(o.normalizedName));
+          const stillFailedOrgs = failedOrgRecords.filter(
+            (o) => existingOrgMap.get(o.normalizedName) === "failed"
+          );
+          for (const org of stillFailedOrgs) {
+            await tx
+              .update(organizations)
+              .set({
+                errorMessage: org.errorMessage,
+                updatedAt: new Date(),
+              })
+              .where(
+                and(
+                  eq(organizations.userId, userId),
+                  eq(organizations.normalizedName, org.normalizedName),
+                )
+              );
+          }
+
+          // Batch insert repositories to avoid SQLite parameter limit (dynamic by column count)
+          const sample = newRepos[0];
+          const columnCount = Object.keys(sample ?? {}).length || 1;
+          const REPO_BATCH_SIZE = calcBatchSizeForInsert(columnCount);
+          if (insertedRepos.length > 0) {
+            for (let i = 0; i < insertedRepos.length; i += REPO_BATCH_SIZE) {
+              const batch = insertedRepos.slice(i, i + REPO_BATCH_SIZE);
+              await tx
+                .insert(repositories)
+                .values(batch)
+                .onConflictDoNothing({
+                  target: [repositories.userId, repositories.sourceId, repositories.normalizedFullName],
+                });
+            }
+          }
+
+          // Batch insert organizations (they have fewer fields, so we can use larger batches)
+          const ORG_BATCH_SIZE = 100;
+          const allNewOrgs = [...insertedOrgs, ...insertedFailedOrgs];
+          if (allNewOrgs.length > 0) {
+            for (let i = 0; i < allNewOrgs.length; i += ORG_BATCH_SIZE) {
+              const batch = allNewOrgs.slice(i, i + ORG_BATCH_SIZE);
+              await tx.insert(organizations).values(batch);
+            }
+          }
+          pinnedOrgNames = [...recoveredOrgs, ...insertedOrgs].map((org) => org.normalizedName);
+        });
+
+        for (const normalizedName of pinnedOrgNames) {
+          pinnedThisRun.set(normalizedName, source.id);
+        }
+        for (const normalizedName of clearedOrgNames) {
+          pinnedThisRun.delete(normalizedName);
+        }
+
+        // Create mirror jobs only for newly inserted items
+        const mirrorJobPromises = [
+          ...insertedRepos.map((repo) =>
+            createMirrorJob({
+              userId,
+              repositoryId: repo.id,
+              repositoryName: repo.name,
+              status: "imported",
+              message: `Repository ${repo.name} fetched successfully`,
+              details: `Repository ${repo.name} was fetched from ${sourceLabel}`,
+            })
+          ),
+          ...insertedOrgs.map((org) =>
+            createMirrorJob({
+              userId,
+              organizationId: org.id,
+              organizationName: org.name,
+              status: "imported",
+              message: `Organization ${org.name} fetched successfully`,
+              details: `Organization ${org.name} was fetched from ${sourceLabel}`,
+            })
+          ),
+        ];
+
+        await Promise.all(mirrorJobPromises);
+
+        totalInsertedRepos += insertedRepos.length;
+        totalInsertedOrgs += insertedOrgs.length;
+        totalRecoveredOrgs += recoveredOrgCount;
+        failedOrgNames.push(
+          ...failedOrgs
+            .filter((o) => !ignoredOrgNames.has(o.name.toLowerCase()))
+            .map((o) => o.name)
+        );
+      } catch (sourceError) {
+        console.error(`Sync failed for source ${source.name} (${source.id}):`, sourceError);
+        failedSourceNames.push(source.name);
+      }
+    }
+
+    const attemptedSourceCount = sources.length - skippedPublicSourceNames.length;
+    if (attemptedSourceCount > 0 && failedSourceNames.length === attemptedSourceCount) {
+      return createSecureErrorResponse(
+        new Error("every enabled source failed to sync"),
+        "source data sync",
+        502
+      );
+    }
+
+    return jsonResponse({
+      data: {
+        success: true,
+        message:
+          attemptedSourceCount === 0 && skippedPublicSourceNames.length > 0
+            ? "Nothing to import: every connected source is public only, so it has no account to list repositories from. Public organizations are imported from the Organizations page."
+            : "Repositories and organizations synced successfully",
+        newRepositories: totalInsertedRepos,
+        newOrganizations: totalInsertedOrgs,
+        skippedDisabledRepositories: totalSkippedDisabled,
+        failedOrgs: failedOrgNames,
+        failedSources: failedSourceNames,
+        skippedPublicSources: skippedPublicSourceNames,
+        recoveredOrgs: totalRecoveredOrgs,
+      },
+    });
+  } catch (error) {
+    return createSecureErrorResponse(error, "source data sync", 500);
+  }
+};

@@ -1,0 +1,1174 @@
+import type { Config } from "@/types/config";
+import type {
+  IssueStateFilter,
+  MirrorOverrides,
+  ReleaseType,
+  Repository,
+} from "@/lib/db/schema";
+import { mirrorOverridesSchema } from "@/lib/db/schema";
+import {
+  normalizeSourceProviderKind,
+  sourceKindSupportsReleases,
+} from "@/lib/source-providers/kinds";
+import { isPushDestinationKind, normalizeDestinationProviderKind } from "@/lib/destination-kinds";
+
+/**
+ * The mirror option flags that can be overridden per organization and per
+ * repository. These mirror the flag names on `giteaConfigSchema` so the
+ * resolver can read both tiers with the same key.
+ */
+export const MIRROR_OVERRIDE_KEYS = [
+  "lfs",
+  "wiki",
+  "mirrorReleases",
+  "mirrorMetadata",
+  "mirrorIssues",
+  "mirrorIssueComments",
+  "mirrorIssueMedia",
+  "mirrorPullRequests",
+  "mirrorLabels",
+  "mirrorMilestones",
+] as const;
+
+export type MirrorOverrideKey = (typeof MIRROR_OVERRIDE_KEYS)[number];
+
+/**
+ * The numeric mirror options that can be overridden per organization and per
+ * repository. Kept apart from the boolean flags because every consumer of
+ * MIRROR_OVERRIDE_KEYS (resolver, gating, dialog tri-states) assumes booleans.
+ *
+ * `releaseLimit` is how many of the newest releases exist in Gitea at all.
+ * `releaseAssetLimit` (#311) is how many of those also get their assets
+ * uploaded; the rest are created with notes and tag only.
+ */
+export const MIRROR_OVERRIDE_LIMIT_KEYS = ["releaseLimit", "releaseAssetLimit"] as const;
+
+export type MirrorOverrideLimitKey = (typeof MIRROR_OVERRIDE_LIMIT_KEYS)[number];
+
+/**
+ * The choice-based mirror options that can be overridden per organization and
+ * per repository. Kept apart from the flags and the limits because both the
+ * tri-state toggles and the numeric rows in the dialog assume those shapes.
+ *
+ * `releaseType` decides which releases are candidates at all; `releaseLimit`
+ * then decides how many of the matching ones are kept. `mirrorIssueState`
+ * selects which source issues the issue pass lists.
+ */
+export const MIRROR_OVERRIDE_CHOICE_KEYS = [
+  "releaseType",
+  "mirrorIssueState",
+] as const;
+
+export type MirrorOverrideChoiceKey =
+  (typeof MIRROR_OVERRIDE_CHOICE_KEYS)[number];
+
+/**
+ * The tag-pattern mirror options that can be overridden per organization and
+ * per repository. Kept apart from the flags, limits and choices because all of
+ * those assume a scalar value; these hold a list of patterns.
+ *
+ * `releaseIncludeTags` keeps only the releases whose tag matches one of the
+ * patterns, `releaseExcludeTags` drops the ones that do. Both run after
+ * `releaseType` and before `releaseLimit`.
+ */
+export const MIRROR_OVERRIDE_PATTERN_KEYS = [
+  "releaseIncludeTags",
+  "releaseExcludeTags",
+] as const;
+
+export type MirrorOverridePatternKey =
+  (typeof MIRROR_OVERRIDE_PATTERN_KEYS)[number];
+
+/**
+ * Organization-tier selection overrides: per-organization switches that steer
+ * which source repositories are imported and mirrored, not what a mirror
+ * contains. They are kept apart from `MIRROR_OVERRIDE_KEYS` because that list
+ * mirrors `giteaConfigSchema` flag names so the resolver can read the global
+ * tier with the same key — the global tier for these lives on
+ * `githubConfig` instead, and they are meaningless at the repository tier.
+ */
+export const ORG_SELECTION_OVERRIDE_KEYS = ["skipForks"] as const;
+
+export type OrgSelectionOverrideKey = (typeof ORG_SELECTION_OVERRIDE_KEYS)[number];
+
+/** Matches `giteaConfigSchema.releaseLimit`'s default. */
+export const DEFAULT_RELEASE_LIMIT = 10;
+
+/** Matches `giteaConfigSchema.releaseType`'s default. */
+export const DEFAULT_RELEASE_TYPE: ReleaseType = "all";
+
+/** Matches `giteaConfigSchema.mirrorIssueState`'s default. */
+export const DEFAULT_ISSUE_STATE: IssueStateFilter = "all";
+
+/**
+ * Flags whose absent global value means "on". The schema defaults cover saved
+ * configs, but the resolver also runs against partial configs (tests, older
+ * callers), where an absent key must not silently turn issue content off.
+ */
+const FLAG_DEFAULTS: Partial<Record<MirrorOverrideKey, boolean>> = {
+  mirrorIssueComments: true,
+  mirrorIssueMedia: true,
+};
+
+/**
+ * How many releases the mirror looks at when any release filter is active.
+ *
+ * Filtering happens before the limit, so without a wider window a repository
+ * whose newest releases are all filtered out would mirror nothing at all when
+ * asked for the other kind. 100 is GitHub's maximum page size, so it costs one
+ * extra page at most.
+ */
+export const RELEASE_SCAN_WINDOW = 100;
+
+/**
+ * Bounds on stored tag patterns. They are compiled into regular expressions on
+ * every mirror run, so a hand-edited row holding thousands of them cannot be
+ * allowed to turn a sync into a regex benchmark.
+ */
+export const MAX_RELEASE_TAG_PATTERNS = 20;
+export const MAX_RELEASE_TAG_PATTERN_LENGTH = 200;
+
+/**
+ * Fully resolved mirror options: every flag has a definite boolean value, the
+ * release limit a definite positive integer, and the asset limit either a
+ * non-negative integer or `null` for "assets for every mirrored release".
+ */
+export type ResolvedMirrorOptions = Record<MirrorOverrideKey, boolean> & {
+  releaseLimit: number;
+  releaseAssetLimit: number | null;
+  // Global only: a cleanup policy for the destination rather than something a
+  // single repository argues about. The ranks it prunes by still come from that
+  // repository's own effective `releaseAssetLimit`.
+  pruneOldReleaseAssets: boolean;
+  releaseType: ReleaseType;
+  releaseIncludeTags: string[];
+  releaseExcludeTags: string[];
+  mirrorIssueState: IssueStateFilter;
+};
+
+/**
+ * The values the tiers above an override resolve to right now. Used by the
+ * dialog to label what "Inherit" means for each row. A `null` asset limit is
+ * a known value ("all"), distinct from `undefined` (not known yet).
+ */
+export type InheritedMirrorOptions = Partial<Record<MirrorOverrideKey, boolean>> & {
+  releaseLimit?: number;
+  releaseAssetLimit?: number | null;
+  releaseType?: ReleaseType;
+  releaseIncludeTags?: string[];
+  releaseExcludeTags?: string[];
+  mirrorIssueState?: IssueStateFilter;
+  skipForks?: boolean;
+};
+
+/**
+ * Sanitize a release limit from any tier into a positive integer, or
+ * `undefined` when the value is absent or unusable (so the next tier out is
+ * consulted). Floors fractional input rather than rejecting it, matching what
+ * `mirrorGitHubReleasesToGitea` has always done with the global value.
+ */
+export function normalizeReleaseLimit(value: unknown): number | undefined {
+  if (typeof value !== "number" || !Number.isFinite(value)) return undefined;
+  const limit = Math.floor(value);
+  return limit >= 1 ? limit : undefined;
+}
+
+/**
+ * Sanitize a release asset limit from any tier into a non-negative integer,
+ * or `undefined` when the value is absent or unusable (so the next tier out
+ * is consulted). Unlike the release limit, 0 is meaningful here: it means
+ * release notes only, no assets. There is no numeric "all"; that is what the
+ * absence of a limit at every tier (`null`) resolves to.
+ */
+export function normalizeReleaseAssetLimit(value: unknown): number | undefined {
+  if (typeof value !== "number" || !Number.isFinite(value)) return undefined;
+  const limit = Math.floor(value);
+  return limit >= 0 ? limit : undefined;
+}
+
+const ISSUE_STATES: readonly IssueStateFilter[] = ["all", "open", "closed"];
+
+/**
+ * Sanitize an issue-state filter from any tier into one of the known values,
+ * or `undefined` when it is absent or unusable so the next tier out is
+ * consulted. Case is folded so an env var or a hand-edited row behaves like
+ * the value the UI writes.
+ */
+export function normalizeIssueState(value: unknown): IssueStateFilter | undefined {
+  if (typeof value !== "string") return undefined;
+  const state = value.trim().toLowerCase();
+  return ISSUE_STATES.find((candidate) => candidate === state);
+}
+
+const RELEASE_TYPES: readonly ReleaseType[] = ["all", "stable"];
+
+/**
+ * Sanitize a release type from any tier into one of the known values, or
+ * `undefined` when it is absent or unusable (so the next tier out is
+ * consulted). Case is folded so a hand-written `RELEASE_TYPE=Stable` env var
+ * behaves the same as the value the UI writes.
+ */
+export function normalizeReleaseType(value: unknown): ReleaseType | undefined {
+  if (typeof value !== "string") return undefined;
+  const type = value.trim().toLowerCase();
+  return RELEASE_TYPES.find((candidate) => candidate === type);
+}
+
+/**
+ * Whether a release belongs to the configured type.
+ *
+ * The `prerelease` flag is the only signal: GitHub and Gitea both report it.
+ * A source that does not report it (`undefined`/`null`) counts as a normal
+ * release, which keeps `stable` from silently dropping everything.
+ */
+export function releaseMatchesType(
+  release: { prerelease?: boolean | null },
+  releaseType: ReleaseType
+): boolean {
+  if (releaseType === "all") return true;
+  return release.prerelease !== true;
+}
+
+/**
+ * Sanitize a tag-pattern list from any tier into a usable list, or `undefined`
+ * when it is absent or unusable (so the next tier out is consulted). Entries
+ * that are not non-empty strings are ignored one by one, duplicates collapse,
+ * and the list is capped so a hand-edited row cannot grow past what a mirror
+ * run should compile.
+ *
+ * An empty list is deliberately not a pin: clearing the field in the UI means
+ * "inherit", the same way an empty release-limit box does.
+ */
+export function normalizeReleaseTagPatterns(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+
+  const seen = new Set<string>();
+  const patterns: string[] = [];
+  for (const entry of value) {
+    if (typeof entry !== "string") continue;
+    const pattern = entry.trim();
+    if (!pattern || pattern.length > MAX_RELEASE_TAG_PATTERN_LENGTH) continue;
+    const key = pattern.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    patterns.push(pattern);
+    if (patterns.length >= MAX_RELEASE_TAG_PATTERNS) break;
+  }
+
+  return patterns.length > 0 ? patterns : undefined;
+}
+
+/**
+ * Split a tag rules box into entries on commas that sit OUTSIDE a /.../ pair.
+ *
+ * Regex bodies legitimately contain commas - `^v\d{1,3}\.\d+$` is full of them -
+ * so a naive split(",") turns one regex into two globs that match nothing. A
+ * backslash escapes the next character, which keeps `\/` from closing the body
+ * early. Slashes that do not open an entry (mid-glob, as in `a/b`) are literal.
+ *
+ * An unterminated `/` swallows the rest of the text into one entry; the compile
+ * step then rejects it, so the dialog can flag the typo instead of storing a
+ * glob that silently matches nothing.
+ */
+export function splitReleaseTagEntries(text: string): string[] {
+  const entries: string[] = [];
+  let current = "";
+  let insideRegex = false;
+  for (let i = 0; i < text.length; i++) {
+    const char = text[i];
+    if (insideRegex) {
+      if (char === "\\") {
+        current += char;
+        i++;
+        if (i < text.length) current += text[i];
+        continue;
+      }
+      if (char === "/") insideRegex = false;
+      current += char;
+      continue;
+    }
+    if (char === "/" && current.trim() === "") {
+      insideRegex = true;
+      current += char;
+      continue;
+    }
+    if (char === ",") {
+      entries.push(current);
+      current = "";
+      continue;
+    }
+    current += char;
+  }
+  entries.push(current);
+  return entries.map((entry) => entry.trim()).filter(Boolean);
+}
+
+/** Escape everything that has a meaning inside a regular expression. */
+function escapeRegexChars(value: string): string {
+  return value.replace(/[.+^${}()|[\]\\]/g, "\\$&");
+}
+
+/** Turn a whole-string glob into a regular expression source. */
+function globToRegexSource(glob: string): string {
+  let source = "";
+  for (const char of glob) {
+    if (char === "*") source += ".*";
+    else if (char === "?") source += ".";
+    else source += escapeRegexChars(char);
+  }
+  return `^(?:${source})$`;
+}
+
+/** Keep any flags the user asked for, but always match case-insensitively. */
+function releaseTagPatternFlags(flags: string): string {
+  const cleaned = flags
+    .split("")
+    .filter((flag) => "imsuy".includes(flag))
+    .join("");
+  return cleaned.includes("i") ? cleaned : `${cleaned}i`;
+}
+
+/**
+ * Compile one stored tag pattern.
+ *
+ * A pattern wrapped in slashes (`/v1\.\d+$/`) is a JavaScript regular
+ * expression, which is the escape hatch for whoever needs it. Anything else is a
+ * glob matched against the whole tag name: `*` is any run of characters, `?` is
+ * exactly one, everything else is literal. So `*-rc.*` skips `v1.0-rc.1` and
+ * `v2.0-rc2`, while plain `rc` matches nothing but a tag spelled `rc`. Case is
+ * ignored either way, because upstreams spell their tags however they like.
+ *
+ * Returns `null` for a pattern that cannot be used, including a regular
+ * expression that does not compile. Dropping it beats throwing: one typo must
+ * not stop a mirror run.
+ */
+export function compileReleaseTagPattern(pattern: unknown): RegExp | null {
+  if (typeof pattern !== "string") return null;
+
+  const trimmed = pattern.trim();
+  if (!trimmed) return null;
+
+  if (trimmed.length > 2 && trimmed.startsWith("/")) {
+    const closing = trimmed.lastIndexOf("/");
+    if (closing > 0) {
+      const trailing = trimmed.slice(closing + 1);
+      // Anything after the closing slash has to be regex flags. Junk like the
+      // `bar` in `/foo, /bar` means the "regex" was really an unterminated one
+      // that swallowed a later slash, so reject it rather than silently
+      // dropping the junk and compiling something the user never wrote.
+      if (/^[imsuy]*$/.test(trailing)) {
+        const body = trimmed.slice(1, closing);
+        if (body) {
+          try {
+            return new RegExp(body, releaseTagPatternFlags(trailing));
+          } catch {
+            return null;
+          }
+        }
+      }
+    }
+    // A leading slash with no closing slash is an unfinished regex, not a tag
+    // spelled with a leading slash (tags cannot start with one). Rejecting it
+    // lets the dialog flag the typo instead of keeping a glob that silently
+    // matches nothing.
+    return null;
+  }
+
+  try {
+    return new RegExp(globToRegexSource(trimmed), "i");
+  } catch {
+    return null;
+  }
+}
+
+/** Compile a whole list, dropping the entries that cannot be used. */
+export function compileReleaseTagPatterns(
+  patterns: readonly unknown[] | null | undefined
+): RegExp[] {
+  if (!Array.isArray(patterns)) return [];
+
+  const compiled: RegExp[] = [];
+  for (const pattern of patterns) {
+    const regex = compileReleaseTagPattern(pattern);
+    if (regex) compiled.push(regex);
+  }
+  return compiled;
+}
+
+/** True when at least one compiled pattern matches the tag. */
+export function releaseTagMatchesAny(
+  tag: string,
+  patterns: readonly RegExp[]
+): boolean {
+  return patterns.some((pattern) => pattern.test(tag ?? ""));
+}
+
+/**
+ * Whether a tag survives the include and exclude lists.
+ *
+ * Exclude wins when a tag is named by both, because "only these, except that
+ * one" is the only reading that makes such a configuration mean anything.
+ */
+export function releaseMatchesTagFilters(
+  tag: string,
+  includePatterns: readonly RegExp[],
+  excludePatterns: readonly RegExp[]
+): boolean {
+  if (includePatterns.length > 0 && !releaseTagMatchesAny(tag, includePatterns)) {
+    return false;
+  }
+  if (excludePatterns.length > 0 && releaseTagMatchesAny(tag, excludePatterns)) {
+    return false;
+  }
+  return true;
+}
+
+/**
+ * How many releases to fetch before filtering. Without a filter the limit is
+ * enough; with one (a release type or either tag list), the newest releases may
+ * all be filtered out, so the mirror looks further back before applying
+ * `releaseLimit`.
+ */
+export function releaseScanLimit(
+  releaseLimit: number,
+  releaseType: ReleaseType,
+  hasTagFilter = false
+): number {
+  return releaseType === "all" && !hasTagFilter
+    ? releaseLimit
+    : Math.max(releaseLimit, RELEASE_SCAN_WINDOW);
+}
+
+/** Per-key sanitizers for the numeric overrides. */
+const LIMIT_NORMALIZERS: Record<
+  MirrorOverrideLimitKey,
+  (value: unknown) => number | undefined
+> = {
+  releaseLimit: normalizeReleaseLimit,
+  releaseAssetLimit: normalizeReleaseAssetLimit,
+};
+
+/** Per-key sanitizers for the choice overrides. */
+const CHOICE_NORMALIZERS: Record<
+  MirrorOverrideChoiceKey,
+  (value: unknown) => ReleaseType | IssueStateFilter | undefined
+> = {
+  releaseType: normalizeReleaseType,
+  mirrorIssueState: normalizeIssueState,
+};
+
+/** Per-key sanitizers for the tag-pattern overrides. */
+const PATTERN_NORMALIZERS: Record<
+  MirrorOverridePatternKey,
+  (value: unknown) => string[] | undefined
+> = {
+  releaseIncludeTags: normalizeReleaseTagPatterns,
+  releaseExcludeTags: normalizeReleaseTagPatterns,
+};
+
+/**
+ * Whether the release at `index` in the newest-first list gets its assets
+ * uploaded. `null` means no limit. A release past the limit still gets its
+ * notes and tag, and assets that already reached Gitea are not removed by this
+ * rule on its own; it only decides whether a sync uploads. The opt-in
+ * `pruneOldReleaseAssets` config switch is what applies the same rank rule in
+ * reverse and deletes what an earlier, looser limit had uploaded.
+ */
+export function releaseGetsAssets(
+  index: number,
+  releaseAssetLimit: number | null
+): boolean {
+  return releaseAssetLimit === null || index < releaseAssetLimit;
+}
+
+/**
+ * Flags the starred-code-only clamp forces off.
+ *
+ * Shared by the resolver and the UI gating helper so the two cannot drift.
+ * `lfs` is deliberately absent: LFS is repository content, not metadata, and
+ * turning it off per repository is the entire point of issue #361. It must
+ * stay editable for starred repos.
+ */
+export const STARRED_CLAMPED_KEYS = [
+  "wiki",
+  "mirrorReleases",
+  "mirrorMetadata",
+  "mirrorIssues",
+  "mirrorIssueComments",
+  "mirrorIssueMedia",
+  "mirrorPullRequests",
+  "mirrorLabels",
+  "mirrorMilestones",
+] as const satisfies readonly MirrorOverrideKey[];
+
+/**
+ * Flags that only work for GitHub sources.
+ *
+ * Issue, pull request, label and milestone mirroring read the GitHub API. A
+ * repository from GitLab or Gitea gets code, wiki and LFS through the Gitea
+ * pull mirror, so the resolver forces these off for it regardless of what any
+ * tier asked for.
+ *
+ * `mirrorReleases` is deliberately not in this list since #440: releases are
+ * gated on `sourceKindSupportsReleases` instead, which also allows Gitea and
+ * Forgejo sources. GitLab still ends up with releases off, through that gate.
+ */
+export const GITHUB_ONLY_METADATA_KEYS = [
+  "mirrorMetadata",
+  "mirrorIssues",
+  "mirrorIssueComments",
+  "mirrorIssueMedia",
+  "mirrorPullRequests",
+  "mirrorLabels",
+  "mirrorMilestones",
+] as const satisfies readonly MirrorOverrideKey[];
+
+/**
+ * Flags that cannot take effect on a push target.
+ *
+ * GitHub and GitLab destinations receive `git push` of branches and tags
+ * and nothing else: no wiki clone, no LFS transfer, no issues, releases,
+ * labels or milestones. The resolver forces all of these off for them.
+ */
+export const PUSH_TARGET_CLAMPED_KEYS = [
+  "lfs",
+  "wiki",
+  "mirrorReleases",
+  "mirrorMetadata",
+  "mirrorIssues",
+  "mirrorIssueComments",
+  "mirrorIssueMedia",
+  "mirrorPullRequests",
+  "mirrorLabels",
+  "mirrorMilestones",
+] as const satisfies readonly MirrorOverrideKey[];
+
+/** True when a config's destination is served by the push engine. */
+export function isPushDestinationConfig(config: { giteaConfig?: { provider?: unknown } | null } | null | undefined): boolean {
+  return isPushDestinationKind(normalizeDestinationProviderKind(config?.giteaConfig?.provider));
+}
+
+/**
+ * Flags surfaced in the override UI.
+ *
+ * `mirrorMetadata` is intentionally excluded. It is a write-time master switch
+ * in the global settings UI (config-mapper ANDs it into the individual flags
+ * when the config is saved) and is never read by the mirror paths in gitea.ts
+ * or gitea-enhanced.ts. A per-object override for it would resolve correctly
+ * and then change nothing, which is exactly the silent no-op this UI is meant
+ * to avoid.
+ */
+export const UI_MIRROR_OVERRIDE_KEYS: MirrorOverrideKey[] = [
+  "lfs",
+  "wiki",
+  "mirrorIssues",
+  "mirrorIssueComments",
+  "mirrorIssueMedia",
+  "mirrorPullRequests",
+  "mirrorReleases",
+  "mirrorLabels",
+  "mirrorMilestones",
+];
+
+/**
+ * Convert the API's `mirrorOptions` shape into the flag keys used everywhere
+ * else.
+ *
+ * `/api/config` does not return the mirror flags on `giteaConfig`. On the way
+ * out, `mapDbToUiConfig` reshapes them into `mirrorOptions`, which uses
+ * different names (`mirrorLFS`, not `lfs`) and nests the metadata flags under
+ * `metadataComponents` with short names (`issues`, not `mirrorIssues`). Client
+ * code reading `giteaConfig.lfs` therefore gets `undefined`, not `false`, which
+ * is indistinguishable from "off" once coerced.
+ *
+ * The mapping is 1:1 with the fields the runtime reads. `metadataComponents.*`
+ * carries the raw stored values (`issues` is `giteaConfig.mirrorIssues`
+ * untouched), so passing them straight through reproduces exactly what
+ * gitea.ts and gitea-enhanced.ts will do.
+ *
+ * Deliberately does NOT AND the components with `mirrorMetadata`. That switch
+ * is a write-path concern: `mapUiToDbConfig` already applies it when
+ * persisting, so a config saved through the settings UI has it baked into the
+ * stored flag. Applying it again on read double-applies it. That is invisible
+ * while the stored state is self-consistent, and wrong when it is not, which
+ * is reachable via env vars: MIRROR_METADATA=false with MIRROR_ISSUES=true
+ * stores `mirrorMetadata:false, mirrorIssues:true`, and the runtime mirrors
+ * issues. A second AND here would report "off" for something that is on.
+ */
+export function mirrorOptionsToFlags(
+  mirrorOptions:
+    | {
+        mirrorLFS?: boolean;
+        mirrorReleases?: boolean;
+        releaseLimit?: number;
+        releaseAssetLimit?: number | null;
+        releaseType?: ReleaseType;
+        releaseIncludeTags?: string[];
+        releaseExcludeTags?: string[];
+        mirrorMetadata?: boolean;
+        issueState?: IssueStateFilter;
+        issueComments?: boolean;
+        issueMedia?: boolean;
+        metadataComponents?: {
+          issues?: boolean;
+          pullRequests?: boolean;
+          labels?: boolean;
+          milestones?: boolean;
+          wiki?: boolean;
+        };
+      }
+    | null
+    | undefined
+): InheritedMirrorOptions {
+  const components = mirrorOptions?.metadataComponents;
+
+  // Straight through: each field is the raw stored value the runtime reads.
+  return {
+    lfs: !!mirrorOptions?.mirrorLFS,
+    mirrorReleases: !!mirrorOptions?.mirrorReleases,
+    wiki: !!components?.wiki,
+    mirrorIssues: !!components?.issues,
+    mirrorIssueComments: mirrorOptions?.issueComments ?? true,
+    mirrorIssueMedia: mirrorOptions?.issueMedia ?? true,
+    mirrorIssueState:
+      normalizeIssueState(mirrorOptions?.issueState) ?? DEFAULT_ISSUE_STATE,
+    mirrorPullRequests: !!components?.pullRequests,
+    mirrorLabels: !!components?.labels,
+    mirrorMilestones: !!components?.milestones,
+    releaseLimit:
+      normalizeReleaseLimit(mirrorOptions?.releaseLimit) ?? DEFAULT_RELEASE_LIMIT,
+    releaseAssetLimit:
+      normalizeReleaseAssetLimit(mirrorOptions?.releaseAssetLimit) ?? null,
+    releaseType: normalizeReleaseType(mirrorOptions?.releaseType) ?? DEFAULT_RELEASE_TYPE,
+    releaseIncludeTags:
+      normalizeReleaseTagPatterns(mirrorOptions?.releaseIncludeTags) ?? [],
+    releaseExcludeTags:
+      normalizeReleaseTagPatterns(mirrorOptions?.releaseExcludeTags) ?? [],
+  };
+}
+
+/** Reasons a toggle is disabled. Shown verbatim in the dialog. */
+export const MIRROR_GATING_REASONS = {
+  starredCodeOnly:
+    "Starred repos mirror code only (Advanced Options > starred code only)",
+  labelsFollowIssues: "Issues mirroring already syncs labels",
+  issuesOff: "Issues are not being mirrored",
+  releasesOff: "Releases are not being mirrored",
+  pushTarget: "Not available for GitHub and GitLab destinations: only branches and tags are pushed",
+} as const;
+
+/** key -> reason it cannot take effect. Absent key means editable. */
+export type MirrorOverrideGating = Partial<
+  Record<
+    MirrorOverrideKey | MirrorOverrideLimitKey | MirrorOverrideChoiceKey | MirrorOverridePatternKey | OrgSelectionOverrideKey,
+    string
+  >
+>;
+
+/**
+ * Decide which toggles cannot take effect, and why.
+ *
+ * This is the single source of truth behind the rule that a toggle which
+ * cannot take effect is disabled with a reason rather than silently ignored.
+ * It mirrors the real runtime behavior:
+ *
+ *  - the starred clamp in `resolveMirrorOptions` forces STARRED_CLAMPED_KEYS
+ *    off for starred repos when starredCodeOnly is set, outranking any override
+ *  - `shouldMirrorLabels` in gitea.ts / gitea-enhanced.ts is
+ *    `mirrorLabels && !mirrorIssues`, so labels cannot take effect while issues
+ *    are being mirrored (the issue path already reconciles labels)
+ *  - `releaseLimit` and `releaseAssetLimit` are only read inside the release
+ *    mirror, so they cannot take effect while `mirrorReleases` resolves to off
+ *
+ * `effective` is the value each flag currently resolves to including the
+ * in-progress edit, so the labels and release-limit gates react live as
+ * issues / releases are toggled.
+ */
+export function getMirrorOverrideGating({
+  targetKind,
+  isStarred,
+  starredCodeOnly,
+  effective,
+  destinationProvider,
+}: {
+  targetKind: "repository" | "organization";
+  isStarred?: boolean;
+  starredCodeOnly?: boolean;
+  effective: InheritedMirrorOptions;
+  /** The configured destination kind; push targets disable every toggle. */
+  destinationProvider?: unknown;
+}): MirrorOverrideGating {
+  const gating: MirrorOverrideGating = {};
+
+  // A push target gets branches and tags only, whatever any tier asks for.
+  if (isPushDestinationKind(normalizeDestinationProviderKind(destinationProvider))) {
+    for (const key of PUSH_TARGET_CLAMPED_KEYS) {
+      gating[key] = MIRROR_GATING_REASONS.pushTarget;
+    }
+    gating.releaseLimit = MIRROR_GATING_REASONS.pushTarget;
+    gating.releaseAssetLimit = MIRROR_GATING_REASONS.pushTarget;
+    gating.releaseType = MIRROR_GATING_REASONS.pushTarget;
+    gating.mirrorIssueState = MIRROR_GATING_REASONS.pushTarget;
+    gating.releaseIncludeTags = MIRROR_GATING_REASONS.pushTarget;
+    gating.releaseExcludeTags = MIRROR_GATING_REASONS.pushTarget;
+    return gating;
+  }
+
+  // Organizations are never starred, so the clamp cannot apply to them.
+  const starredClampApplies =
+    targetKind === "repository" && !!isStarred && !!starredCodeOnly;
+
+  if (starredClampApplies) {
+    for (const key of STARRED_CLAMPED_KEYS) {
+      gating[key] = MIRROR_GATING_REASONS.starredCodeOnly;
+    }
+  }
+
+  // Labels ride along with issues. Only report this when the more fundamental
+  // starred clamp has not already disabled the toggle.
+  if (!gating.mirrorLabels && effective.mirrorIssues) {
+    gating.mirrorLabels = MIRROR_GATING_REASONS.labelsFollowIssues;
+  }
+
+  // Issue content filters only mean something while issues are mirrored.
+  // Inherit the starred/push reason when that is what disabled issues.
+  if (gating.mirrorIssues) {
+    gating.mirrorIssueComments = gating.mirrorIssues;
+    gating.mirrorIssueMedia = gating.mirrorIssues;
+    gating.mirrorIssueState = gating.mirrorIssues;
+  } else if (effective.mirrorIssues === false) {
+    gating.mirrorIssueComments = MIRROR_GATING_REASONS.issuesOff;
+    gating.mirrorIssueMedia = MIRROR_GATING_REASONS.issuesOff;
+    gating.mirrorIssueState = MIRROR_GATING_REASONS.issuesOff;
+  }
+
+  // The release limit and the release filters ride along with releases:
+  // inherit the starred reason when that is what disabled releases, otherwise
+  // report releases being off. Only an explicit `false` counts; an unknown
+  // value leaves the fields open.
+  if (gating.mirrorReleases) {
+    gating.releaseLimit = gating.mirrorReleases;
+    gating.releaseType = gating.mirrorReleases;
+  } else if (effective.mirrorReleases === false) {
+    gating.releaseLimit = MIRROR_GATING_REASONS.releasesOff;
+    gating.releaseType = MIRROR_GATING_REASONS.releasesOff;
+  }
+  // The asset limit and both tag lists are read in the same place, so they
+  // share the reason.
+  if (gating.releaseLimit) {
+    gating.releaseAssetLimit = gating.releaseLimit;
+    for (const patternKey of MIRROR_OVERRIDE_PATTERN_KEYS) {
+      gating[patternKey] = gating.releaseLimit;
+    }
+  }
+
+  return gating;
+}
+
+export const MIRROR_OVERRIDE_LABELS: Record<
+  MirrorOverrideKey | MirrorOverrideLimitKey | MirrorOverrideChoiceKey | MirrorOverridePatternKey | OrgSelectionOverrideKey,
+  string
+> = {
+  lfs: "Git LFS files",
+  wiki: "Wiki",
+  mirrorReleases: "Releases",
+  mirrorMetadata: "Metadata",
+  mirrorIssues: "Issues",
+  mirrorIssueComments: "Issue comments",
+  mirrorIssueMedia: "Issue images and attachments",
+  mirrorIssueState: "Issue state",
+  mirrorPullRequests: "Pull requests",
+  mirrorLabels: "Labels",
+  mirrorMilestones: "Milestones",
+  releaseLimit: "Release limit",
+  releaseAssetLimit: "Release asset limit",
+  releaseType: "Release type",
+  releaseIncludeTags: "Include tags",
+  releaseExcludeTags: "Exclude tags",
+  skipForks: "Skip forks",
+};
+
+/**
+ * Normalize a persisted overrides value into a plain object.
+ *
+ * The column is JSON-mode, so Drizzle hands back an object, but rows written
+ * before this feature (or by a raw SQL path) may hold a string or NULL. Invalid
+ * shapes degrade to "no overrides" rather than throwing, because a malformed
+ * override must never be able to break a mirror run.
+ */
+export function parseMirrorOverrides(
+  value: unknown
+): MirrorOverrides | null {
+  if (value == null) return null;
+
+  let candidate = value;
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (!trimmed) return null;
+    try {
+      candidate = JSON.parse(trimmed);
+    } catch {
+      return null;
+    }
+  }
+
+  if (typeof candidate !== "object" || Array.isArray(candidate)) return null;
+
+  const parsed = mirrorOverridesSchema.safeParse(candidate);
+  if (!parsed.success) return null;
+
+  return parsed.data;
+}
+
+/** True when the overrides object actually pins at least one field. */
+export function hasMirrorOverrides(value: unknown): boolean {
+  return listOverriddenKeys(value).length > 0;
+}
+
+/** The keys an overrides object pins, for badges and summaries. */
+export function listOverriddenKeys(
+  value: unknown
+): (MirrorOverrideKey | MirrorOverrideLimitKey | MirrorOverrideChoiceKey | MirrorOverridePatternKey | OrgSelectionOverrideKey)[] {
+  const overrides = parseMirrorOverrides(value);
+  if (!overrides) return [];
+  return [
+    ...MIRROR_OVERRIDE_KEYS.filter((key) => overrides[key] != null),
+    ...MIRROR_OVERRIDE_LIMIT_KEYS.filter(
+      (key) => LIMIT_NORMALIZERS[key](overrides[key]) !== undefined
+    ),
+    ...MIRROR_OVERRIDE_CHOICE_KEYS.filter(
+      (key) => CHOICE_NORMALIZERS[key](overrides[key]) !== undefined
+    ),
+    ...MIRROR_OVERRIDE_PATTERN_KEYS.filter(
+      (key) => PATTERN_NORMALIZERS[key](overrides[key]) !== undefined
+    ),
+    ...ORG_SELECTION_OVERRIDE_KEYS.filter((key) => overrides[key] != null),
+  ];
+}
+
+/**
+ * Strip fields that are null/undefined (or, for limits, unusable) so only
+ * genuine pins are stored, and collapse an empty result to null. Keeps "no
+ * overrides" as a single canonical representation instead of `{}` vs
+ * `{lfs: null}` vs NULL.
+ */
+export function normalizeMirrorOverrides(
+  value: unknown
+): MirrorOverrides | null {
+  const overrides = parseMirrorOverrides(value);
+  if (!overrides) return null;
+
+  const cleaned: MirrorOverrides = {};
+  for (const key of MIRROR_OVERRIDE_KEYS) {
+    const flag = overrides[key];
+    if (typeof flag === "boolean") cleaned[key] = flag;
+  }
+  for (const key of MIRROR_OVERRIDE_LIMIT_KEYS) {
+    const limit = LIMIT_NORMALIZERS[key](overrides[key]);
+    if (limit !== undefined) cleaned[key] = limit;
+  }
+  for (const key of MIRROR_OVERRIDE_CHOICE_KEYS) {
+    const choice = CHOICE_NORMALIZERS[key](overrides[key]);
+    if (choice !== undefined) cleaned[key] = choice;
+  }
+  for (const key of MIRROR_OVERRIDE_PATTERN_KEYS) {
+    const patterns = PATTERN_NORMALIZERS[key](overrides[key]);
+    if (patterns !== undefined) cleaned[key] = patterns;
+  }
+  for (const key of ORG_SELECTION_OVERRIDE_KEYS) {
+    const flag = overrides[key];
+    if (typeof flag === "boolean") cleaned[key] = flag;
+  }
+
+  return Object.keys(cleaned).length > 0 ? cleaned : null;
+}
+
+/**
+ * Resolve the effective mirror options for one repository.
+ *
+ * Precedence is per field, most specific tier wins:
+ *   repository override -> organization override -> global config -> default
+ * where the default is `false` for flags, DEFAULT_RELEASE_LIMIT for the
+ * release limit, `null` (every mirrored release) for the asset limit,
+ * DEFAULT_RELEASE_TYPE for which releases are candidates, and an empty list for
+ * the tag patterns (no tag filter).
+ *
+ * `starredCodeOnly` is applied last as a hard clamp. It is a "code only, no
+ * metadata" switch for starred repos, so it forces every metadata flag off
+ * regardless of what any tier asked for. That preserves the pre-existing
+ * behavior of `skipMetadataForStarred`, which this function subsumes.
+ *
+ * Pure and synchronous by design: the organization overrides are fetched by
+ * the caller (see `loadOrganizationMirrorOverrides`) so this stays trivially
+ * testable.
+ */
+export function resolveMirrorOptions({
+  config,
+  repository,
+  orgOverrides,
+}: {
+  config: Partial<Config>;
+  repository: Pick<Repository, "isStarred" | "mirrorOverrides"> &
+    Partial<Pick<Repository, "sourceProvider">>;
+  orgOverrides?: unknown;
+}): ResolvedMirrorOptions {
+  const globalConfig = config.giteaConfig;
+  const org = parseMirrorOverrides(orgOverrides);
+  const repo = parseMirrorOverrides(repository.mirrorOverrides);
+
+  const resolved = {} as ResolvedMirrorOptions;
+
+  for (const key of MIRROR_OVERRIDE_KEYS) {
+    const repoValue = repo?.[key];
+    const orgValue = org?.[key];
+
+    if (typeof repoValue === "boolean") {
+      resolved[key] = repoValue;
+    } else if (typeof orgValue === "boolean") {
+      resolved[key] = orgValue;
+    } else {
+      const globalValue = globalConfig?.[key];
+      resolved[key] =
+        typeof globalValue === "boolean" ? globalValue : FLAG_DEFAULTS[key] ?? !!globalValue;
+    }
+  }
+
+  // Same precedence for the release limit. An unusable value at any tier
+  // (0, negative, NaN) falls through to the next one instead of being clamped
+  // up to 1, so a bad override cannot silently shrink a repo to one release.
+  resolved.releaseLimit =
+    normalizeReleaseLimit(repo?.releaseLimit) ??
+    normalizeReleaseLimit(org?.releaseLimit) ??
+    normalizeReleaseLimit(globalConfig?.releaseLimit) ??
+    DEFAULT_RELEASE_LIMIT;
+
+  // The asset limit has no numeric default: when no tier pins one, every
+  // mirrored release gets its assets, which is what happened before #311.
+  // A pinned 0 is a real value (notes only) and must not fall through.
+  resolved.releaseAssetLimit =
+    normalizeReleaseAssetLimit(repo?.releaseAssetLimit) ??
+    normalizeReleaseAssetLimit(org?.releaseAssetLimit) ??
+    normalizeReleaseAssetLimit(globalConfig?.releaseAssetLimit) ??
+    null;
+
+  // Same precedence for the release type. A value no tier recognizes (a typo
+  // typed straight into the database, say) falls back to mirroring every
+  // release rather than to a filter that would hide work from the user.
+  resolved.releaseType =
+    normalizeReleaseType(repo?.releaseType) ??
+    normalizeReleaseType(org?.releaseType) ??
+    normalizeReleaseType(globalConfig?.releaseType) ??
+    DEFAULT_RELEASE_TYPE;
+
+  // Issue state follows the same precedence and the same "an unusable value
+  // falls through to the next tier" rule. Nothing pinned means mirror every
+  // issue, like every configuration from before this option existed.
+  resolved.mirrorIssueState =
+    normalizeIssueState(repo?.mirrorIssueState) ??
+    normalizeIssueState(org?.mirrorIssueState) ??
+    normalizeIssueState(globalConfig?.mirrorIssueState) ??
+    DEFAULT_ISSUE_STATE;
+
+  // And the same for the tag lists. No tier pins one means no filter, which is
+  // what every configuration predating the option does. A tier that pins an
+  // empty or unusable list is not a pin either, so the next tier out still
+  // applies: clearing the box in the UI means inherit, not "no patterns here".
+  resolved.releaseIncludeTags =
+    normalizeReleaseTagPatterns(repo?.releaseIncludeTags) ??
+    normalizeReleaseTagPatterns(org?.releaseIncludeTags) ??
+    normalizeReleaseTagPatterns(globalConfig?.releaseIncludeTags) ??
+    [];
+
+  resolved.releaseExcludeTags =
+    normalizeReleaseTagPatterns(repo?.releaseExcludeTags) ??
+    normalizeReleaseTagPatterns(org?.releaseExcludeTags) ??
+    normalizeReleaseTagPatterns(globalConfig?.releaseExcludeTags) ??
+    [];
+
+  // No per-repo or per-org tier for the pruning switch, and no stored value
+  // means the safe default: never delete what the destination already holds.
+  resolved.pruneOldReleaseAssets = globalConfig?.pruneOldReleaseAssets === true;
+
+  // Starred repos with starredCodeOnly mirror code and nothing else. This
+  // clamp intentionally outranks explicit per-repo overrides: the setting
+  // exists to stop starred repos from dragging in metadata wholesale.
+  const skipMetadataForStarred =
+    !!repository.isStarred && !!config.githubConfig?.starredCodeOnly;
+
+  if (skipMetadataForStarred) {
+    // STARRED_CLAMPED_KEYS is shared with getMirrorOverrideGating so the set of
+    // flags the UI disables always matches the set the runtime forces off.
+    // Note it excludes `lfs` by design.
+    for (const key of STARRED_CLAMPED_KEYS) {
+      resolved[key] = false;
+    }
+  }
+
+  // Metadata mirroring needs the GitHub API. Rows without a source
+  // provider predate the column and came from GitHub.
+  const sourceKind = normalizeSourceProviderKind(repository.sourceProvider);
+  if (sourceKind !== "github") {
+    for (const key of GITHUB_ONLY_METADATA_KEYS) {
+      resolved[key] = false;
+    }
+  }
+
+  // Releases are listed through the source API, which GitHub and
+  // Gitea/Forgejo both expose (#440). GitLab is code only, so it lands here.
+  if (!sourceKindSupportsReleases(sourceKind)) {
+    resolved.mirrorReleases = false;
+  }
+
+  // A push target receives branches and tags only.
+  if (isPushDestinationConfig(config)) {
+    for (const key of PUSH_TARGET_CLAMPED_KEYS) {
+      resolved[key] = false;
+    }
+  }
+
+  return resolved;
+}
+
+/**
+ * Resolve the fork policy for one organization.
+ *
+ * Precedence: organization override -> global `githubConfig.skipForks` ->
+ * false. An organization pinning `false` keeps its forks even when the
+ * global switch skips forks everywhere else, and vice versa.
+ */
+export function resolveOrganizationSkipForks({
+  orgOverrides,
+  config,
+}: {
+  orgOverrides: unknown;
+  config: Partial<Config>;
+}): boolean {
+  const org = parseMirrorOverrides(orgOverrides);
+  if (typeof org?.skipForks === "boolean") return org.skipForks;
+  return config.githubConfig?.skipForks ?? false;
+}
+
+/**
+ * Build the per-repository fork decision for bulk paths that hold the fork
+ * pin map from `loadOrganizationForkPolicies` instead of one org row. The
+ * returned predicate applies the same precedence as
+ * `resolveOrganizationSkipForks`: a pinned org wins over the global switch,
+ * unpinned orgs and personal repos follow it.
+ */
+export function orgForkSkipDecision(
+  orgForkOverrides: Map<string, boolean> | undefined,
+  config: Partial<Config>
+): (organizationName: string | null | undefined) => boolean {
+  const globalSkipForks = config.githubConfig?.skipForks ?? false;
+  return (organizationName) => {
+    const key = (organizationName ?? "").trim().toLowerCase();
+    if (key && orgForkOverrides?.has(key)) return orgForkOverrides.get(key)!;
+    return globalSkipForks;
+  };
+}
+
+/**
+ * Load every organization that pins a fork policy, keyed by normalized name.
+ *
+ * Bulk import paths consult this per repository: an org-repository fork is
+ * dropped or kept according to its org's pin, while repos of unpinned orgs
+ * fall back to the global `skipForks`. Failures degrade to an empty map so a
+ * DB hiccup cannot fail the import.
+ */
+export async function loadOrganizationForkPolicies({
+  userId,
+}: {
+  userId?: string;
+}): Promise<Map<string, boolean>> {
+  const policies = new Map<string, boolean>();
+  if (!userId) return policies;
+
+  try {
+    const { db, organizations } = await import("@/lib/db");
+    const { eq } = await import("drizzle-orm");
+
+    const rows = await db
+      .select({
+        normalizedName: organizations.normalizedName,
+        mirrorOverrides: organizations.mirrorOverrides,
+      })
+      .from(organizations)
+      .where(eq(organizations.userId, userId));
+
+    for (const row of rows) {
+      const overrides = parseMirrorOverrides(row.mirrorOverrides);
+      if (typeof overrides?.skipForks === "boolean") {
+        policies.set(row.normalizedName, overrides.skipForks);
+      }
+    }
+  } catch (error) {
+    console.error(
+      `[MirrorOverrides] Failed to load organization fork policies: ${
+        error instanceof Error ? error.message : String(error)
+      }`
+    );
+  }
+
+  return policies;
+}
+
+/**
+ * Fetch the organization-tier overrides for a repository, if it belongs to one.
+ *
+ * Returns null for personal repos, unknown orgs, or when the org has no
+ * overrides set. Failures are swallowed to null: a DB hiccup reading an
+ * optional override must not fail the mirror.
+ */
+export async function loadOrganizationMirrorOverrides({
+  organizationName,
+  userId,
+}: {
+  organizationName?: string | null;
+  userId?: string;
+}): Promise<MirrorOverrides | null> {
+  if (!organizationName || !userId) return null;
+
+  try {
+    const { db, organizations } = await import("@/lib/db");
+    const { and, eq } = await import("drizzle-orm");
+
+    const [org] = await db
+      .select({ mirrorOverrides: organizations.mirrorOverrides })
+      .from(organizations)
+      .where(
+        and(
+          eq(organizations.userId, userId),
+          eq(organizations.name, organizationName)
+        )
+      )
+      .limit(1);
+
+    return parseMirrorOverrides(org?.mirrorOverrides);
+  } catch (error) {
+    console.error(
+      `[MirrorOverrides] Failed to load organization overrides for ${organizationName}: ${
+        error instanceof Error ? error.message : String(error)
+      }`
+    );
+    return null;
+  }
+}
+
+/**
+ * Convenience wrapper: load the org tier then resolve. This is what the mirror
+ * paths in gitea.ts call.
+ */
+export async function resolveMirrorOptionsForRepository({
+  config,
+  repository,
+}: {
+  config: Partial<Config>;
+  repository: Repository;
+}): Promise<ResolvedMirrorOptions> {
+  const orgOverrides = await loadOrganizationMirrorOverrides({
+    organizationName: repository.organization,
+    userId: config.userId,
+  });
+
+  return resolveMirrorOptions({ config, repository, orgOverrides });
+}

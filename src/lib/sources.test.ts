@@ -1,0 +1,249 @@
+import { beforeAll, describe, expect, test } from "bun:test";
+import {
+  decryptSourceToken,
+  deriveSourceName,
+  findSourceForOrganization,
+  findSourceForRepository,
+  selectSameRunPinsToClear,
+  primarySource,
+  resolveGitHubApiBaseUrl,
+  selectRepositoriesToRelink,
+  type SourceRecord,
+} from "./sources";
+import { encrypt } from "./utils/encryption";
+
+// ---------------------------------------------------------------------------
+// These tests need the real module, but gitea-enhanced.test.ts and several
+// route tests replace @/lib/sources process-wide (decryptSourceToken becomes
+// `token ?? ""`), and bun's mock.module leaks into every file that runs after
+// them. Which file runs first depends on the runner, so this file re-runs
+// itself in an isolated child process where nothing else has been loaded.
+// ---------------------------------------------------------------------------
+const CHILD_FLAG = "SOURCES_TEST_ISOLATED";
+const isChild = !!process.env[CHILD_FLAG];
+
+if (!isChild) {
+  test("sources - isolated child suite", () => {
+    const res = Bun.spawnSync({
+      cmd: [process.execPath, "test", import.meta.path],
+      env: { ...process.env, [CHILD_FLAG]: "1" },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    if (res.exitCode !== 0) {
+      console.error(res.stdout.toString());
+      console.error(res.stderr.toString());
+    }
+    expect(res.exitCode).toBe(0);
+  }, 60_000);
+}
+
+function source(overrides: Partial<SourceRecord> = {}): SourceRecord {
+  return {
+    id: "src-1",
+    userId: "user-1",
+    name: "GitHub (octocat)",
+    provider: "github",
+    url: "https://github.com",
+    username: "octocat",
+    token: null,
+    enabled: true,
+    createdAt: new Date("2026-01-01T00:00:00Z"),
+    updatedAt: new Date("2026-01-01T00:00:00Z"),
+    ...overrides,
+  };
+}
+
+describe.skipIf(!isChild)("deriveSourceName", () => {
+  test("appends the username when present", () => {
+    expect(deriveSourceName("github", "octocat")).toBe("GitHub (octocat)");
+    expect(deriveSourceName("gitea", "me")).toBe("Gitea / Forgejo (me)");
+  });
+
+  test("falls back to the provider label without a username", () => {
+    expect(deriveSourceName("gitlab", "")).toBe("GitLab");
+  });
+});
+
+describe.skipIf(!isChild)("primarySource", () => {
+  test("returns the first entry", () => {
+    const list = [source({ id: "a" }), source({ id: "b" })];
+    expect(primarySource(list)?.id).toBe("a");
+  });
+
+  test("returns null when nothing is connected", () => {
+    expect(primarySource([])).toBeNull();
+  });
+});
+
+describe.skipIf(!isChild)("findSourceForRepository", () => {
+  const github = source();
+  const gitlab = source({
+    id: "src-2",
+    provider: "gitlab",
+    url: "https://gitlab.com",
+    username: "me",
+  });
+
+  test("matches by the stored source id first", () => {
+    const repo = { sourceId: "src-2", sourceProvider: "github", sourceUrl: "https://github.com" };
+    expect(findSourceForRepository(repo, [github, gitlab])?.id).toBe("src-2");
+  });
+
+  test("falls back to provider and normalized url when the id dangles", () => {
+    const repo = {
+      sourceId: "deleted-source",
+      sourceProvider: "gitlab",
+      sourceUrl: "https://gitlab.com",
+    };
+    expect(findSourceForRepository(repo, [github, gitlab])?.id).toBe("src-2");
+  });
+
+  test("matches by provider and url for legacy rows without a source id", () => {
+    const repo = { sourceProvider: "gitea", sourceUrl: "https://codeberg.org" };
+    const codeberg = source({
+      id: "src-3",
+      provider: "gitea",
+      url: "https://codeberg.org",
+      username: "me",
+    });
+    expect(findSourceForRepository(repo, [github, codeberg])?.id).toBe("src-3");
+  });
+
+  test("returns null for a host that is not connected", () => {
+    const repo = { sourceProvider: "gitlab", sourceUrl: "https://gitlab.example.com" };
+    expect(findSourceForRepository(repo, [github, gitlab])).toBeNull();
+  });
+
+  test("returns null when nothing is connected", () => {
+    const repo = { sourceProvider: "github", sourceUrl: "https://github.com" };
+    expect(findSourceForRepository(repo, [])).toBeNull();
+  });
+});
+
+describe.skipIf(!isChild)("findSourceForOrganization", () => {
+  const github = source();
+  const gitlab = source({
+    id: "src-2",
+    provider: "gitlab",
+    url: "https://gitlab.com",
+    username: "me",
+  });
+
+  test("matches by the stored source id", () => {
+    expect(findSourceForOrganization({ sourceId: "src-2" }, [github, gitlab])?.id).toBe("src-2");
+  });
+
+  test("returns null for an unpinned organization", () => {
+    expect(findSourceForOrganization({}, [github, gitlab])).toBeNull();
+    expect(findSourceForOrganization({ sourceId: null }, [github, gitlab])).toBeNull();
+  });
+
+  test("returns null for a dangling pin instead of another source", () => {
+    expect(findSourceForOrganization({ sourceId: "deleted-source" }, [github, gitlab])).toBeNull();
+  });
+
+  test("returns null when nothing is connected", () => {
+    expect(findSourceForOrganization({ sourceId: "src-1" }, [])).toBeNull();
+  });
+});
+
+describe.skipIf(!isChild)("selectSameRunPinsToClear", () => {
+  const discovered = [{ normalizedName: "acme" }, { normalizedName: "tools" }];
+
+  test("clears a pin an earlier source in the same run created", () => {
+    const pinnedThisRun = new Map([["acme", "src-1"]]);
+    expect(selectSameRunPinsToClear(discovered, pinnedThisRun, "src-2")).toEqual(["acme"]);
+  });
+
+  test("leaves organizations the run has not pinned alone", () => {
+    // "tools" was pinned before the run (or never), so it is not in the map.
+    const pinnedThisRun = new Map([["other", "src-1"]]);
+    expect(selectSameRunPinsToClear(discovered, pinnedThisRun, "src-2")).toEqual([]);
+  });
+
+  test("keeps a pin the same source created", () => {
+    const pinnedThisRun = new Map([["acme", "src-2"]]);
+    expect(selectSameRunPinsToClear(discovered, pinnedThisRun, "src-2")).toEqual([]);
+  });
+
+  test("names each organization once", () => {
+    const pinnedThisRun = new Map([["acme", "src-1"]]);
+    const twice = [...discovered, { normalizedName: "acme" }];
+    expect(selectSameRunPinsToClear(twice, pinnedThisRun, "src-2")).toEqual(["acme"]);
+  });
+});
+
+describe.skipIf(!isChild)("selectRepositoriesToRelink", () => {
+  const connected = new Set(["src-1"]);
+  const base = {
+    sourceProvider: "github" as const,
+    sourceUrl: "https://github.com",
+    normalizedFullName: "octocat/tool",
+    updatedAt: new Date("2026-01-01T00:00:00Z"),
+  };
+
+  test("collects dangling and null-id rows for the same provider and host", () => {
+    const rows = [
+      { id: "r-1", sourceId: "deleted-source", ...base },
+      { id: "r-2", sourceId: null, ...base, normalizedFullName: "octocat/second" },
+      { id: "r-3", ...base, normalizedFullName: "octocat/third" },
+    ];
+    const result = selectRepositoriesToRelink(rows, connected, "github", "https://github.com");
+    expect(result.relinkIds).toEqual(["r-1", "r-2", "r-3"]);
+    expect(result.duplicateIds).toEqual([]);
+  });
+
+  test("keeps rows owned by a live source or another host", () => {
+    const rows = [
+      { id: "r-1", sourceId: "src-1", ...base },
+      { id: "r-2", sourceId: "deleted-source", ...base, sourceProvider: "gitlab" as const, sourceUrl: "https://gitlab.com" },
+      { id: "r-3", sourceId: "deleted-source", ...base, sourceUrl: "https://ghe.example.com" },
+    ];
+    const result = selectRepositoriesToRelink(rows, connected, "github", "https://github.com");
+    expect(result.relinkIds).toEqual([]);
+    expect(result.duplicateIds).toEqual([]);
+  });
+
+  test("same-name stale rows collapse to the newest one so the relink cannot violate the unique index", () => {
+    const rows = [
+      { id: "r-old", sourceId: "dead-incarnation-1", ...base, updatedAt: new Date("2026-01-01T00:00:00Z") },
+      { id: "r-new", sourceId: "dead-incarnation-2", ...base, updatedAt: new Date("2026-02-01T00:00:00Z") },
+      { id: "r-other", sourceId: null, ...base, normalizedFullName: "octocat/other" },
+    ];
+    const result = selectRepositoriesToRelink(rows, connected, "github", "https://github.com");
+    expect(result.relinkIds).toEqual(["r-new", "r-other"]);
+    expect(result.duplicateIds).toEqual(["r-old"]);
+  });
+});
+
+describe.skipIf(!isChild)("decryptSourceToken", () => {
+  beforeAll(() => {
+    // encrypt() needs a secret; do not depend on the environment or on test order.
+    process.env.ENCRYPTION_SECRET ??= "sources-test-encryption-secret";
+  });
+
+  test("round-trips an encrypted token", () => {
+    expect(decryptSourceToken(encrypt("ghp-secret"))).toBe("ghp-secret");
+  });
+
+  test("empty means public-only and never throws", () => {
+    expect(decryptSourceToken(null)).toBe("");
+    expect(decryptSourceToken(undefined)).toBe("");
+    expect(decryptSourceToken("")).toBe("");
+  });
+});
+
+describe.skipIf(!isChild)("resolveGitHubApiBaseUrl", () => {
+  test("github.com and empty keep the environment default", () => {
+    expect(resolveGitHubApiBaseUrl("https://github.com")).toBeUndefined();
+    expect(resolveGitHubApiBaseUrl("")).toBeUndefined();
+    expect(resolveGitHubApiBaseUrl(null)).toBeUndefined();
+    expect(resolveGitHubApiBaseUrl(undefined)).toBeUndefined();
+  });
+
+  test("a GitHub Enterprise instance is addressed at /api/v3", () => {
+    expect(resolveGitHubApiBaseUrl("https://ghe.example.com")).toBe("https://ghe.example.com/api/v3");
+    expect(resolveGitHubApiBaseUrl("https://ghe.example.com/")).toBe("https://ghe.example.com/api/v3");
+  });
+});

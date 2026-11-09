@@ -1,0 +1,374 @@
+import type { ActivityStatus, RepoStatus } from "@/types/Repository";
+import { db, mirrorJobs } from "./db";
+import { eq, and } from "drizzle-orm";
+import { buildInterruptedJobsCondition } from "./interrupted-job-detection";
+import { v4 as uuidv4 } from "uuid";
+import { publishEvent } from "./events";
+import { withKeyedLock } from "./utils/keyed-mutex";
+import { triggerJobNotification } from "./notification-service";
+
+export async function createMirrorJob({
+  userId,
+  organizationId,
+  organizationName,
+  repositoryId,
+  repositoryName,
+  message,
+  status,
+  details,
+  jobType,
+  batchId,
+  totalItems,
+  itemIds,
+  inProgress,
+  skipDuplicateEvent,
+  skipNotification,
+}: {
+  userId: string;
+  organizationId?: string;
+  organizationName?: string;
+  repositoryId?: string;
+  repositoryName?: string;
+  details?: string;
+  message: string;
+  status: ActivityStatus;
+  jobType?: "mirror" | "sync" | "retry";
+  batchId?: string;
+  totalItems?: number;
+  itemIds?: string[];
+  inProgress?: boolean;
+  skipDuplicateEvent?: boolean; // Option to skip event publishing for internal operations
+  skipNotification?: boolean; // Option to skip push notifications for specific internal operations
+}) {
+  const jobId = uuidv4();
+  const currentTimestamp = new Date();
+
+  const job = {
+    id: jobId,
+    userId,
+    repositoryId,
+    repositoryName,
+    organizationId,
+    organizationName,
+    details,
+    message: message,
+    status: status,
+    timestamp: currentTimestamp,
+
+    // New resilience fields
+    jobType: jobType || "mirror",
+    batchId: batchId || undefined,
+    totalItems: totalItems || undefined,
+    completedItems: 0,
+    itemIds: itemIds || undefined,
+    completedItemIds: [],
+    inProgress: inProgress !== undefined ? inProgress : false,
+    startedAt: inProgress ? currentTimestamp : undefined,
+    completedAt: undefined,
+    // An in-progress job starts with a checkpoint at its creation time.
+    // Without one, findInterruptedJobs used to treat the job as
+    // interrupted before its first item finished (issue #372).
+    lastCheckpoint: inProgress ? currentTimestamp : undefined,
+  };
+
+  try {
+    // Insert the job into the database
+    await db.insert(mirrorJobs).values(job);
+
+    // Publish realtime status events unless explicitly skipped
+    if (!skipDuplicateEvent) {
+      const channel = `mirror-status:${userId}`;
+
+      // Create deduplication key based on the operation
+      let deduplicationKey: string | undefined;
+      if (repositoryId && status) {
+        deduplicationKey = `repo-${repositoryId}-${status}`;
+      } else if (organizationId && status) {
+        deduplicationKey = `org-${organizationId}-${status}`;
+      } else if (batchId) {
+        deduplicationKey = `batch-${batchId}-${status}`;
+      }
+
+      await publishEvent({
+        userId,
+        channel,
+        payload: job,
+        deduplicationKey
+      });
+    }
+
+    // Trigger push notifications for terminal statuses (never blocks the mirror flow).
+    // Keep this independent from skipDuplicateEvent so event-stream suppression does not
+    // silently disable user-facing notifications.
+    if (!skipNotification && (status === "failed" || status === "mirrored" || status === "synced")) {
+      triggerJobNotification({ userId, status, repositoryName, organizationName, message, details }).catch(err => {
+        console.error("[NotificationService] Background notification failed:", err);
+      });
+    }
+
+    return jobId;
+  } catch (error) {
+    console.error("Error creating mirror job:", error);
+    throw new Error("Error creating mirror job");
+  }
+}
+
+/**
+ * Updates the progress of a mirror job.
+ *
+ * Progress is a read-modify-write of the completedItemIds list, and items
+ * finish concurrently, so the update runs under a per-job lock: two items
+ * completing in the same tick used to read the same list and one of them
+ * silently overwrote the other. A resume then re-processed the lost item.
+ *
+ * `silent` records the progress without publishing an event. Every completed
+ * item is checkpointed so a resume knows exactly what is done; the events the
+ * dashboard listens to are throttled by the caller instead.
+ */
+export async function updateMirrorJobProgress(params: {
+  jobId: string;
+  completedItemId?: string;
+  status?: RepoStatus;
+  message?: string;
+  details?: string;
+  inProgress?: boolean;
+  isCompleted?: boolean;
+  /** Record a new start time, as when recovery resumes the job. */
+  startedAt?: Date;
+  /** Write the progress without publishing a mirror-status event. */
+  silent?: boolean;
+}) {
+  return withKeyedLock(`mirror-job:${params.jobId}`, () => updateMirrorJobProgressLocked(params));
+}
+
+async function updateMirrorJobProgressLocked({
+  jobId,
+  completedItemId,
+  status,
+  message,
+  details,
+  inProgress,
+  isCompleted,
+  startedAt,
+  silent = false,
+}: Parameters<typeof updateMirrorJobProgress>[0]) {
+  try {
+    // Get the current job
+    const [job] = await db
+      .select()
+      .from(mirrorJobs)
+      .where(eq(mirrorJobs.id, jobId));
+
+    if (!job) {
+      throw new Error(`Mirror job with ID ${jobId} not found`);
+    }
+
+    // Update the job with new progress
+    const updates: Record<string, any> = {
+      lastCheckpoint: new Date(),
+    };
+
+    // Add completed item if provided
+    if (completedItemId) {
+      const completedItemIds = job.completedItemIds || [];
+      if (!completedItemIds.includes(completedItemId)) {
+        updates.completedItemIds = [...completedItemIds, completedItemId];
+        updates.completedItems = (job.completedItems || 0) + 1;
+      }
+    }
+
+    if (startedAt) {
+      updates.startedAt = startedAt;
+    }
+
+    // Update status if provided
+    if (status) {
+      updates.status = status;
+    }
+
+    // Update message if provided
+    if (message) {
+      updates.message = message;
+    }
+
+    // Update details if provided
+    if (details) {
+      updates.details = details;
+    }
+
+    // Update in-progress status if provided
+    if (inProgress !== undefined) {
+      updates.inProgress = inProgress;
+    }
+
+    // Mark as completed if specified
+    if (isCompleted) {
+      updates.inProgress = false;
+      updates.completedAt = new Date();
+    }
+
+    // Update the job in the database
+    await db
+      .update(mirrorJobs)
+      .set(updates)
+      .where(eq(mirrorJobs.id, jobId));
+
+    // Publish the event with deduplication
+    const updatedJob = {
+      ...job,
+      ...updates,
+    };
+
+    if (silent) {
+      return updatedJob;
+    }
+
+    // Create deduplication key for progress updates
+    let deduplicationKey: string | undefined;
+    if (completedItemId) {
+      deduplicationKey = `progress-${jobId}-${completedItemId}`;
+    } else if (isCompleted) {
+      deduplicationKey = `completed-${jobId}`;
+    } else {
+      deduplicationKey = `update-${jobId}-${Date.now()}`;
+    }
+
+    await publishEvent({
+      userId: job.userId,
+      channel: `mirror-status:${job.userId}`,
+      payload: updatedJob,
+      deduplicationKey
+    });
+
+    return updatedJob;
+  } catch (error) {
+    console.error("Error updating mirror job progress:", error);
+    throw new Error("Error updating mirror job progress");
+  }
+}
+
+/**
+ * Refreshes a job's checkpoint without recording progress. Called on a
+ * timer while a job is processing so that one long-running item (a large
+ * repository migration) cannot outlive the interrupted-job cutoff and get
+ * "resumed" by recovery while it is still live (issue #372).
+ *
+ * Only touches rows that are still in progress, so a heartbeat that fires
+ * after the job completed or failed changes nothing.
+ */
+export async function touchMirrorJobCheckpoint(jobId: string): Promise<void> {
+  await db
+    .update(mirrorJobs)
+    .set({ lastCheckpoint: new Date() })
+    .where(and(eq(mirrorJobs.id, jobId), eq(mirrorJobs.inProgress, true)));
+}
+
+/**
+ * Finds interrupted jobs that need to be resumed with enhanced criteria.
+ *
+ * `logFound` defaults to false because this function is polled from
+ * passive callers (`hasJobsNeedingRecovery` from the health endpoint
+ * and middleware checks). Logging on every poll produces log spam at
+ * one-line-per-poll-per-stuck-job for as long as a job stays stuck.
+ *
+ * Callers that intend to act on the result (i.e. immediately resume
+ * the returned jobs) should pass `logFound: true` so the surfacing
+ * still happens in the recovery flow.
+ */
+export async function findInterruptedJobs(
+  options: { logFound?: boolean } = {}
+) {
+  const { logFound = false } = options;
+  try {
+    // The liveness rule (checkpoint age, stale start, and the grace period
+    // for jobs that have not written a checkpoint yet) lives in
+    // interrupted-job-detection.ts so it can be tested against a real
+    // database. See issue #372 for why a null checkpoint alone is not
+    // enough to call a job interrupted.
+    const interruptedJobs = await db
+      .select()
+      .from(mirrorJobs)
+      .where(buildInterruptedJobsCondition(mirrorJobs));
+
+    // Log details about found jobs for debugging — opt-in to avoid
+    // spamming the log when called from periodic passive checks.
+    if (logFound && interruptedJobs.length > 0) {
+      console.log(`Found ${interruptedJobs.length} interrupted jobs:`);
+      interruptedJobs.forEach(job => {
+        const lastCheckpoint = job.lastCheckpoint ? new Date(job.lastCheckpoint).toISOString() : 'never';
+        const startedAt = job.startedAt ? new Date(job.startedAt).toISOString() : 'unknown';
+        console.log(`- Job ${job.id}: ${job.jobType} (started: ${startedAt}, last checkpoint: ${lastCheckpoint})`);
+      });
+    }
+
+    return interruptedJobs;
+  } catch (error) {
+    console.error("Error finding interrupted jobs:", error);
+    return [];
+  }
+}
+
+/**
+ * Resumes an interrupted job
+ */
+export async function resumeInterruptedJob(job: any) {
+  try {
+    console.log(`Resuming interrupted job: ${job.id}`);
+
+    // Skip if job doesn't have the necessary data to resume
+    if (!job.itemIds || !job.completedItemIds) {
+      console.log(`Cannot resume job ${job.id}: missing item data`);
+
+      // Mark the job as failed
+      await updateMirrorJobProgress({
+        jobId: job.id,
+        status: "failed",
+        message: "Job interrupted and could not be resumed",
+        details: "The job was interrupted and did not have enough information to resume",
+        inProgress: false,
+        isCompleted: true,
+      });
+
+      return null;
+    }
+
+    // Calculate remaining items
+    const remainingItemIds = job.itemIds.filter(
+      (id: string) => !job.completedItemIds.includes(id)
+    );
+
+    if (remainingItemIds.length === 0) {
+      console.log(`Job ${job.id} has no remaining items, marking as completed`);
+
+      // Mark the job as completed
+      await updateMirrorJobProgress({
+        jobId: job.id,
+        status: "mirrored",
+        message: "Job completed after resuming",
+        inProgress: false,
+        isCompleted: true,
+      });
+
+      return null;
+    }
+
+    // Update the job to show it's being resumed. The start time moves to
+    // now so the row records this pass; the fresh checkpoint written here is
+    // what keeps a second recovery sweep from resuming the same job again.
+    await updateMirrorJobProgress({
+      jobId: job.id,
+      message: `Resuming job with ${remainingItemIds.length} remaining items`,
+      details: `Job was interrupted and is being resumed. ${job.completedItemIds.length} of ${job.itemIds.length} items were already processed.`,
+      inProgress: true,
+      startedAt: new Date(),
+    });
+
+    return {
+      job,
+      remainingItemIds,
+    };
+  } catch (error) {
+    console.error(`Error resuming job ${job.id}:`, error);
+    return null;
+  }
+}
