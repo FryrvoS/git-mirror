@@ -59,13 +59,13 @@ export function SignupForm() {
           <div className="flex justify-center mb-4">
             <img
               src={withBase('/logo.png')}
-              alt="Gitea Mirror Logo"
+              alt="Fryrvo Logo"
               className="h-8 w-10"
             />
           </div>
           <CardTitle className="text-2xl">Create Admin Account</CardTitle>
           <CardDescription>
-            Set up your administrator account for Gitea Mirror
+            Set up administrator account for Git Mirror
           </CardDescription>
         </CardHeader>
         <CardContent>

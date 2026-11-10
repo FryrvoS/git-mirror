@@ -1,10 +1,10 @@
-# Minimal Gitea Mirror deployment
+# Minimal Git Mirror deployment
 # Only includes what CANNOT be configured via the Web UI
 # Everything else can be set up through the web interface after deployment
 
 services:
   gitea-mirror:
-    image: docker pull ghcr.io/fryrvo/git-mirror:latest
+    image: ghcr.io/fryrvo/git-mirror:latest
     container_name: gitea-mirror
     restart: unless-stopped
     ports:

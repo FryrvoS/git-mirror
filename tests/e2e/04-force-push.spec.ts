@@ -9,7 +9,7 @@
  *   1. Confirm my-project is already mirrored with known commits / content
  *   2. Record the pre-force-push state (branch SHAs, commit messages, file content)
  *   3. Rewrite history in the source bare repo (simulate a force-push)
- *   4. Trigger Gitea mirror-sync WITHOUT backup
+ *   4. Trigger Git mirror-sync WITHOUT backup
  *   5. Verify Gitea now reflects the rewritten history — old commits are GONE
  *   6. Restore the source repo, re-mirror, then enable backup
  *   7. Force-push again and sync WITH backup enabled

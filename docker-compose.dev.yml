@@ -108,7 +108,7 @@ services:
 volumes:
   gitea-data:    # Gitea data volume
   gitea-config:  # Gitea config volume
-  gitea-mirror-data:  # Gitea Mirror database volume
+  gitea-mirror-data:  # Git Mirror database volume
 
 # Define networks
 networks:

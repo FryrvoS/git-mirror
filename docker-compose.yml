@@ -1,4 +1,4 @@
-# Gitea Mirror deployment configuration
+# Git Mirror deployment configuration
 # Standard deployment with automatic database maintenance
 
 services:

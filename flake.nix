@@ -1,5 +1,5 @@
 {
-  description = "Gitea Mirror - Self-hosted GitHub to Gitea mirroring service";
+  description = "Git Mirror - Self-hosted GitHub to Git mirroring service";
 
   nixConfig = {
     extra-substituters = [
@@ -225,7 +225,7 @@ shutdown_handler() {
 trap 'shutdown_handler' TERM INT HUP
 
 # === START APPLICATION ===
-echo "Starting Gitea Mirror..."
+echo "Starting Git Mirror..."
 echo "Access the web interface at $BETTER_AUTH_URL"
 ${pkgs.bun}/bin/bun dist/server/entry.mjs &
 APP_PID=$!

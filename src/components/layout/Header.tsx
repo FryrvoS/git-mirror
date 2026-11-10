@@ -5,9 +5,10 @@ import { TimeFormatToggle } from "@/components/layout/TimeFormatToggle";
 import { Skeleton } from "@/components/ui/skeleton";
 import { useLiveRefresh } from "@/hooks/useLiveRefresh";
 import { useConfigStatus } from "@/hooks/useConfigStatus";
-import { PanelRightOpen, PanelRightClose } from "lucide-react";
+import { PanelRightOpen, PanelRightClose, Activity } from "lucide-react";
 import { AccountMenu } from "@/components/auth/AccountMenu";
 import { withBase } from "@/lib/base-path";
+import { GitFork, GitBranch } from "lucide-react";
 
 interface HeaderProps {
   currentPage?: "dashboard" | "repositories" | "organizations" | "storage" | "configuration" | "activity-log";
@@ -95,15 +96,55 @@ export function Header({ currentPage, onNavigate, onMenuClick, onToggleCollapse,
             className="flex items-center gap-2 py-1 hover:opacity-80 transition-opacity"
           >
             <img
-              src={withBase('/logo.png')}
-              alt="Gitea Mirror Logo"
-              className="h-5 w-6"
+              src={withBase('/Fryrvo.png')}
+              alt="Fryrvo Logo"
+              className="!h-8 !w-auto !max-w-none object-contain"
+              // ahhhhhhh i change other spot for too many time before i realize this is the spot that needs to be changed
+              // lmao
             />
-            <span className="text-xl font-bold hidden sm:inline">Gitea Mirror</span>
+            <span className="text-xl font-bold hidden sm:inline"> Git Mirror</span>
           </button>
         </div>
 
+        // somelink because it look cool
         <div className="flex items-center gap-2 sm:gap-4">
+          <Button
+            variant="ghost"
+            size="sm"
+            asChild
+            className="hidden md:inline-flex items-center gap-1.5"
+          >
+            <a 
+              href="https://status.Fryrvo.com" 
+              target="_blank" 
+              rel="noopener noreferrer"
+            >
+              <Activity className="h-4 w-4" />
+              <span>Status</span>
+            </a>
+          </Button>
+
+          <Button
+            variant="ghost"
+            size="sm"
+            asChild
+            className="hidden md:inline-flex items-center gap-1.5"
+          >
+            <a 
+              href="https://git.lgbt" 
+              target="_blank" 
+              rel="noopener noreferrer"
+            >
+            <img 
+             src={withBase('/icon/gitlgbtlogo.svg')}
+             alt="Git LGBT Logo" 
+             className="h-4 w-4 object-contain"
+             />
+             <span>Git</span>
+            </a>
+          </Button>
+          
+
           {showLiveButton && (
             <Button
               variant="outline"

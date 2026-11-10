@@ -17,6 +17,5 @@ export const features = {
   giteaMirroring: true,
   scheduling: true,
   multiUser: true,
-  githubSponsors: true,
   unlimitedRepos: true,
 };

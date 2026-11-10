@@ -122,14 +122,14 @@ export function LoginForm() {
         <CardHeader className="text-center">
           <div className="flex justify-center mb-4">
             <img
-              src={withBase('/logo.png')}
-              alt="Gitea Mirror Logo"
-              className="h-8 w-10"
+              src={withBase('/Fryrvo.png')}
+              alt="Fryrvo Logo"
+              className="!h-8 !w-auto !max-w-none object-contain"
             />
           </div>
-          <CardTitle className="text-2xl">Gitea Mirror</CardTitle>
+          <CardTitle className="text-2xl">Git Mirror</CardTitle>
           <CardDescription>
-            Log in to manage your GitHub to Gitea mirroring
+            Log in to manage FryrvoGit mirroring
           </CardDescription>
         </CardHeader>
         
@@ -328,7 +328,7 @@ export function LoginForm() {
         
         <div className="px-6 pb-6 text-center">
           <p className="text-sm text-muted-foreground">
-            Don't have an account? Contact your administrator.
+            Forgot password? Well that is skill issues
           </p>
         </div>
       </Card>

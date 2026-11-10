@@ -228,7 +228,7 @@ shutdown_handler() {
 trap 'shutdown_handler' TERM INT HUP
 
 # Start the application
-echo "Starting Gitea Mirror..."
+echo "Starting Git Mirror..."
 if [ -f "./scripts/runtime-server.ts" ]; then
   bun ./scripts/runtime-server.ts &
 elif [ -f "./dist/scripts/runtime-server.js" ]; then
