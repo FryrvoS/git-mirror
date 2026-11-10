@@ -106,13 +106,13 @@ export function Header({ currentPage, onNavigate, onMenuClick, onToggleCollapse,
           </button>
         </div>
 
-        // somelink because it look cool
         <div className="flex items-center gap-2 sm:gap-4">
           <Button
             variant="ghost"
             size="sm"
             asChild
             className="hidden md:inline-flex items-center gap-1.5"
+            // somelink because it look cool
           >
             <a 
               href="https://status.Fryrvo.com" 
